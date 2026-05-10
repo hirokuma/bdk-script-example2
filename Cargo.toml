@@ -1,0 +1,10 @@
+[package]
+name = "bdk-script-example2"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.102"
+bdk_electrum = "0.24.0"
+bdk_wallet = { version = "3.0.0", features = ["compiler"] }
+hex = "0.4.3"
