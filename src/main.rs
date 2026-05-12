@@ -62,7 +62,7 @@ fn main() -> anyhow::Result<()> {
     let mut preimage = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut preimage);
     // let preimage = hex::decode(PREIMAGE).unwrap();
-    let preimage: [u8; 32] = preimage.try_into().unwrap();
+    // let preimage: [u8; 32] = preimage.try_into().unwrap();
     println!("preimage: {}", hex::encode(preimage));
     let payment_hash: sha256::Hash = sha256::Hash::hash(&preimage);
 
@@ -127,7 +127,7 @@ fn main() -> anyhow::Result<()> {
     let secp = wallet.secp_ctx();
     let definite_htlc = htlc_descriptor
         .at_derivation_index(0)?
-        .derived_descriptor(&secp)?;
+        .derived_descriptor(secp)?;
 
     // ── Tapscript の claim leaf と control block を取り出す ───────────────
     //
@@ -172,7 +172,7 @@ fn main() -> anyhow::Result<()> {
 
     // ── claim_seckey で Schnorr 署名 ─────────────────────────────────────
     let addr1_seckey = secret_key(&wallet, &addr1)?;
-    let keypair = Keypair::from_secret_key(&secp, &addr1_seckey);
+    let keypair = Keypair::from_secret_key(secp, &addr1_seckey);
     let msg = bdk_wallet::bitcoin::secp256k1::Message::from_digest(sighash.to_byte_array());
     let sig = secp.sign_schnorr(&msg, &keypair);
 
@@ -300,9 +300,8 @@ fn create_wallet(seed_hex: &str) -> Wallet {
     let mut seed: [u8; 32] = [0u8; 32];
     hex::decode_to_slice(seed_hex, &mut seed).expect("Invalid seed hex");
 
-    let network: Network = Network::Signet;
-    let kind = NetworkKind::from(network);
-    let xprv: Xpriv = Xpriv::new_master(network, &seed).unwrap();
+    let kind = NetworkKind::from(NETWORK);
+    let xprv: Xpriv = Xpriv::new_master(NETWORK, &seed).unwrap();
     let (descriptor, key_map, _) = Bip86(xprv, KeychainKind::External)
         .build(kind)
         .expect("Failed to build external descriptor");
@@ -340,7 +339,7 @@ fn watch_address(wallet: &mut Wallet, addr: &Address) -> Transaction {
     loop {
         std::thread::sleep(std::time::Duration::from_secs(WATCH_DURATION_SECS));
 
-        let sync_request = sync_request(&wallet, addr);
+        let sync_request = sync_request(wallet, addr);
         let sync_response = client
             .sync(sync_request, BATCH_SIZE, false)
             .expect("Failed to sync");
@@ -413,7 +412,7 @@ fn secret_key(
     let dsk = signers
         .signers()
         .iter()
-        .find_map(|s| s.descriptor_secret_key())
+        .find_map(|&s| s.descriptor_secret_key())
         .ok_or_else(|| anyhow::anyhow!("no secret key in wallet"))?;
 
     match dsk {
@@ -427,7 +426,7 @@ fn secret_key(
                 xkey.derivation_path.into_iter().copied().collect();
             path_vec.push(child);
             let full_path = DerivationPath::from(path_vec);
-            Ok(xkey.xkey.derive_priv(&secp, &full_path)?.private_key)
+            Ok(xkey.xkey.derive_priv(secp, &full_path)?.private_key)
         }
         _ => anyhow::bail!("expected xprv signer"),
     }
