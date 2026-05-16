@@ -6,14 +6,14 @@ use bdk_wallet::{
     bitcoin::{
         Address, Amount, Network, NetworkKind, OutPoint, PublicKey, ScriptBuf, Sequence,
         TapLeafHash, TapSighashType, Transaction, TxIn, Witness, absolute,
-        bip32::Xpriv,
+        bip32::{ChildNumber, DerivationPath, Xpriv},
         consensus::serialize,
         hashes::{Hash, sha256},
         key::{
             Keypair,
             rand::{self, RngCore},
         },
-        secp256k1::{SecretKey, XOnlyPublicKey},
+        secp256k1::{Message, XOnlyPublicKey, schnorr::Signature},
         sighash::{Prevouts, SighashCache},
         taproot::{ControlBlock, LeafVersion, Signature as TaprootSig},
         transaction,
@@ -119,22 +119,12 @@ fn main() -> anyhow::Result<()> {
         }],
     };
 
-    // ── htlc_descriptor の DefiniteDescriptor（Descriptor<PublicKey>）を得る ─
-    //
-    //  at_derivation_index(0) → DefiniteDescriptorKey を確定
-    //  derived_descriptor(secp) → Descriptor<bitcoin::PublicKey>
-    //  これに対して get_satisfaction(satisfier) を呼ぶ。
-    let secp = wallet.secp_ctx();
-    let definite_htlc = htlc_descriptor
-        .at_derivation_index(0)?
-        .derived_descriptor(secp)?;
-
     // ── Tapscript の claim leaf と control block を取り出す ───────────────
     //
     //  Descriptor::Tr(tr).spend_info() で TaprootSpendInfo を得る。
     //  script_map() はすべての (ScriptBuf, LeafVersion) → ControlBlock のマップ。
     //  claim leaf を特定するには、script bytes に claim_xonly の 32 バイトが含まれるかで判断。
-    let (claim_leaf_script, claim_control_block): (ScriptBuf, ControlBlock) = match &definite_htlc {
+    let (claim_leaf_script, claim_control_block): (ScriptBuf, ControlBlock) = match &htlc_derived {
         Descriptor::Tr(tr) => {
             let spend_info = tr.spend_info();
             let xonly_bytes = addr1_xonly.serialize(); // 32 bytes
@@ -171,10 +161,8 @@ fn main() -> anyhow::Result<()> {
     )?;
 
     // ── claim_seckey で Schnorr 署名 ─────────────────────────────────────
-    let addr1_seckey = secret_key(&wallet, &addr1)?;
-    let keypair = Keypair::from_secret_key(secp, &addr1_seckey);
     let msg = bdk_wallet::bitcoin::secp256k1::Message::from_digest(sighash.to_byte_array());
-    let sig = secp.sign_schnorr(&msg, &keypair);
+    let sig = sign_shnorr(&wallet, &addr1, &msg)?;
 
     let taproot_sig = TaprootSig {
         signature: sig,
@@ -182,9 +170,6 @@ fn main() -> anyhow::Result<()> {
     };
 
     // ── Satisfier を実装して miniscript の get_satisfaction() で witness を得る ─
-    //
-    //  definite_htlc は Descriptor<bitcoin::PublicKey> なので
-    //  Satisfier<bitcoin::PublicKey> を実装する必要がある。
     //
     //  lookup_tap_leaf_script_sig: (PublicKey, TapLeafHash) → TaprootSig
     //  lookup_sha256             : sha256::Hash → preimage [u8; 32]
@@ -244,8 +229,19 @@ fn main() -> anyhow::Result<()> {
         control_blocks,
     };
 
+    // ── htlc_descriptor の DefiniteDescriptor（Descriptor<PublicKey>）を得る ─
+    //
+    //  definite_htlc は Descriptor<bitcoin::PublicKey> なので
+    //  Satisfier<bitcoin::PublicKey> を実装する必要がある。
+    //
+    //  at_derivation_index(0) → DefiniteDescriptorKey を確定
+    //  derived_descriptor(secp) → Descriptor<bitcoin::PublicKey>
+    //  これに対して get_satisfaction(satisfier) を呼ぶ。
+    let secp = wallet.secp_ctx();
+    let htlc_definite = htlc_derived.derived_descriptor(secp)?;
+
     // get_satisfaction() → (witness_stack: Vec<Vec<u8>>, _script_sig: ScriptBuf)
-    let (witness_stack, _script_sig) = definite_htlc.get_satisfaction(satisfier)?;
+    let (witness_stack, _script_sig) = htlc_definite.get_satisfaction(satisfier)?;
 
     // witness を spend_tx に設定
     spend_tx.input[0].witness = Witness::from_slice(&witness_stack);
@@ -401,12 +397,11 @@ fn convert_descriptor(
     Ok(xonly)
 }
 
-fn secret_key(
+fn sign_shnorr(
     wallet: &Wallet,
     addr_claim_info: &bdk_wallet::AddressInfo,
-) -> anyhow::Result<SecretKey> {
-    use bdk_wallet::bitcoin::bip32::ChildNumber;
-
+    msg: &Message,
+) -> anyhow::Result<Signature> {
     let secp = wallet.secp_ctx();
     let signers = wallet.get_signers(KeychainKind::External);
     let dsk = signers
@@ -415,19 +410,20 @@ fn secret_key(
         .find_map(|&s| s.descriptor_secret_key())
         .ok_or_else(|| anyhow::anyhow!("no secret key in wallet"))?;
 
-    match dsk {
+    let sec_key = match dsk {
         bdk_wallet::keys::DescriptorSecretKey::XPrv(xkey) => {
             // xkey.xkey        : ExtendedPrivKey（descriptor のルート鍵 tprv...）
             // xkey.derivation_path: /86'/1'/0'/0 部分
             // derive_priv でそこまで降りてから、wildcard の index を追加で derive する
-            use bdk_wallet::bitcoin::bip32::DerivationPath;
             let child = ChildNumber::from_normal_idx(addr_claim_info.index)?;
             let mut path_vec: Vec<ChildNumber> =
                 xkey.derivation_path.into_iter().copied().collect();
             path_vec.push(child);
             let full_path = DerivationPath::from(path_vec);
-            Ok(xkey.xkey.derive_priv(secp, &full_path)?.private_key)
+            xkey.xkey.derive_priv(secp, &full_path)?.private_key
         }
         _ => anyhow::bail!("expected xprv signer"),
-    }
+    };
+    let keypair = Keypair::from_secret_key(secp, &sec_key);
+    Ok(secp.sign_schnorr(&msg, &keypair))
 }
