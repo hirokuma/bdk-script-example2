@@ -82,20 +82,20 @@ fn main() -> anyhow::Result<()> {
     )?;
 
     let htlc_derived = htlc_descriptor.at_derivation_index(0)?;
-    let htlc_address = htlc_derived.address(Network::Regtest)?;
+    let htlc_address = htlc_derived.address(NETWORK)?;
     println!("HTLC Address: {}", htlc_address);
 
     let tx = watch_address(&mut wallet, &htlc_address);
     let txid = tx.compute_txid();
-    let mut index = 0;
-    for txout in &tx.output {
-        if txout.script_pubkey == htlc_address.script_pubkey() {
-            break;
-        }
-        index += 1;
-    }
-
-    let txout = tx.output[index].clone();
+    let (index, txout) = match tx
+        .output
+        .iter()
+        .enumerate()
+        .find(|&(_, item)| item.script_pubkey == htlc_address.script_pubkey())
+    {
+        Some(res) => res,
+        None => anyhow::bail!("HTLC output not found in the transaction"),
+    };
     let prev_output = OutPoint {
         txid,
         vout: index as u32,
@@ -425,5 +425,5 @@ fn sign_shnorr(
         _ => anyhow::bail!("expected xprv signer"),
     };
     let keypair = Keypair::from_secret_key(secp, &sec_key);
-    Ok(secp.sign_schnorr(&msg, &keypair))
+    Ok(secp.sign_schnorr(msg, &keypair))
 }
