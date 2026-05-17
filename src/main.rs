@@ -1,29 +1,23 @@
-use std::{collections::BTreeMap, str::FromStr};
+mod htlc;
 
 use bdk_electrum::{BdkElectrumClient, electrum_client, electrum_client::Client};
 use bdk_wallet::{
     KeychainKind, Wallet,
     bitcoin::{
-        Address, Amount, Network, NetworkKind, OutPoint, PublicKey, ScriptBuf, Sequence,
-        TapLeafHash, TapSighashType, Transaction, TxIn, Witness, absolute,
-        bip32::{ChildNumber, DerivationPath, Xpriv},
+        Address, Amount, Network, NetworkKind, OutPoint, ScriptBuf, Sequence, Transaction, TxIn,
+        Witness, absolute,
+        bip32::Xpriv,
         consensus::serialize,
-        hashes::{Hash, sha256},
-        key::{
-            Keypair,
-            rand::{self, RngCore},
-        },
-        secp256k1::{Message, XOnlyPublicKey, schnorr::Signature},
-        sighash::{Prevouts, SighashCache},
-        taproot::{ControlBlock, LeafVersion, Signature as TaprootSig},
+        key::rand::{self, RngCore},
+        secp256k1::XOnlyPublicKey,
         transaction,
     },
     chain::spk_client::{SyncRequest, SyncRequestBuilder},
-    descriptor,
-    keys::DescriptorPublicKey,
-    miniscript::{Descriptor, Preimage32, Satisfier},
+    miniscript::Descriptor,
     template::{Bip86, DescriptorTemplate},
 };
+
+use htlc::Htlc;
 
 const ELECTRUM_SERVER: &str = "tcp://localhost:50001";
 const STOP_GAP: usize = 50;
@@ -31,16 +25,8 @@ const BATCH_SIZE: usize = 5;
 const NETWORK: Network = Network::Regtest;
 const WATCH_DURATION_SECS: u64 = 1;
 
-// pick as internal key a "Nothing Up My Sleeve" (NUMS) point
-// TODO H + rG
-// https://github.com/bitcoin/bips/blob/master/bip-0341.mediawiki#constructing-and-spending-taproot-outputs
-const NUMS_XPUBKEY: &str = "50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0";
-
-// テストのため固定値
-// const SEED: &str = "55a89a1ef590feea61ee171e84936fd3c1ee4aba94d4283cf74664b1191186ce";
 const ADDR1_INDEX: u32 = 0;
 const ADDR2_INDEX: u32 = 1;
-// const PREIMAGE: &str = "465a9a18ea11c40ea501e7e1e4cfd6c9ae629999d3546ef4bb1e2e56590935ab";
 
 fn main() -> anyhow::Result<()> {
     let seed = create_seed();
@@ -61,26 +47,9 @@ fn main() -> anyhow::Result<()> {
     // preimageとpayment_hashの生成
     let mut preimage = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut preimage);
-    // let preimage = hex::decode(PREIMAGE).unwrap();
-    // let preimage: [u8; 32] = preimage.try_into().unwrap();
-    println!("preimage: {}", hex::encode(preimage));
-    let payment_hash: sha256::Hash = sha256::Hash::hash(&preimage);
 
-    let addr1_xonly = convert_descriptor(&wallet, &addr1)?;
-    let addr2_xonly = convert_descriptor(&wallet, &addr2)?;
-    let intr_ext = DescriptorPublicKey::from_str(NUMS_XPUBKEY)
-        .inspect_err(|e| eprintln!("Internal key error: {}", e))
-        .unwrap();
-    let (htlc_descriptor, _key_map, _networks) = descriptor!(
-        tr(
-            intr_ext,
-            {
-                and_v(v:sha256(payment_hash), pk(addr1_xonly)),
-                and_v(v:older(16),            pk(addr2_xonly))
-            }
-        )
-    )?;
-
+    let htlc = Htlc::new(preimage.to_vec(), 16, addr1.clone(), addr2.clone())?;
+    let htlc_descriptor = htlc.generate_descriptor(&wallet)?;
     let htlc_derived = htlc_descriptor.at_derivation_index(0)?;
     let htlc_address = htlc_derived.address(NETWORK)?;
     println!("HTLC Address: {}", htlc_address);
@@ -119,132 +88,10 @@ fn main() -> anyhow::Result<()> {
         }],
     };
 
-    // ── Tapscript の claim leaf と control block を取り出す ───────────────
-    //
-    //  Descriptor::Tr(tr).spend_info() で TaprootSpendInfo を得る。
-    //  script_map() はすべての (ScriptBuf, LeafVersion) → ControlBlock のマップ。
-    //  claim leaf を特定するには、script bytes に claim_xonly の 32 バイトが含まれるかで判断。
-    let (claim_leaf_script, claim_control_block): (ScriptBuf, ControlBlock) = match &htlc_derived {
-        Descriptor::Tr(tr) => {
-            let spend_info = tr.spend_info();
-            let xonly_bytes = addr1_xonly.serialize(); // 32 bytes
-            spend_info
-                .script_map()
-                .keys()
-                .find_map(|(script, ver)| {
-                    if script.as_bytes().windows(32).any(|w| w == xonly_bytes) {
-                        spend_info
-                            .control_block(&(script.clone(), *ver))
-                            .map(|cb| (script.clone(), cb))
-                    } else {
-                        None
-                    }
-                })
-                .ok_or_else(|| anyhow::anyhow!("claim leaf not found"))?
-        }
-        _ => anyhow::bail!("expected Taproot descriptor"),
-    };
-
-    let leaf_hash = TapLeafHash::from_script(&claim_leaf_script, LeafVersion::TapScript);
-
-    // ── TapScript sighash を計算 ──────────────────────────────────────────
-    //
-    //  SighashCache::taproot_script_spend_signature_hash() に
-    //  input index、prevouts、leaf hash、sighash type を渡す。
-    let prevouts = [txout.clone()];
-    let mut sighash_cache = SighashCache::new(&spend_tx);
-    let sighash = sighash_cache.taproot_script_spend_signature_hash(
-        0,
-        &Prevouts::All(&prevouts),
-        leaf_hash,
-        TapSighashType::Default,
-    )?;
-
-    // ── claim_seckey で Schnorr 署名 ─────────────────────────────────────
-    let msg = bdk_wallet::bitcoin::secp256k1::Message::from_digest(sighash.to_byte_array());
-    let sig = sign_shnorr(&wallet, &addr1, &msg)?;
-
-    let taproot_sig = TaprootSig {
-        signature: sig,
-        sighash_type: TapSighashType::Default,
-    };
-
-    // ── Satisfier を実装して miniscript の get_satisfaction() で witness を得る ─
-    //
-    //  lookup_tap_leaf_script_sig: (PublicKey, TapLeafHash) → TaprootSig
-    //  lookup_sha256             : sha256::Hash → preimage [u8; 32]
-    //  lookup_tap_control_block_map: ControlBlock → (ScriptBuf, LeafVersion)
-    //
-    //  get_satisfaction() は witness stack (Vec<Vec<u8>>) と script_sig を返す。
-    //  Tapscript の場合は script_sig は空で、witness stack に:
-    //    [<sig>, <preimage>, <leaf_script>, <control_block>]
-    //  が積まれる。
-
-    struct ClaimSatisfier {
-        sigs: BTreeMap<(PublicKey, TapLeafHash), TaprootSig>,
-        preimages: BTreeMap<sha256::Hash, Preimage32>,
-        control_blocks: BTreeMap<ControlBlock, (ScriptBuf, LeafVersion)>,
-    }
-
-    impl Satisfier<PublicKey> for ClaimSatisfier {
-        fn lookup_tap_leaf_script_sig(
-            &self,
-            pk: &PublicKey,
-            lh: &TapLeafHash,
-        ) -> Option<TaprootSig> {
-            self.sigs.get(&(*pk, *lh)).copied()
-        }
-
-        fn lookup_sha256(&self, h: &sha256::Hash) -> Option<Preimage32> {
-            self.preimages.get(h).copied()
-        }
-
-        fn lookup_tap_control_block_map(
-            &self,
-        ) -> Option<&BTreeMap<ControlBlock, (ScriptBuf, LeafVersion)>> {
-            Some(&self.control_blocks)
-        }
-    }
-
-    // Satisfier<PublicKey> のキーは bitcoin::PublicKey（compressed 33-byte）
-    // claim_xonly → bitcoin::PublicKey へ変換（Taproot は even parity と仮定）
-    let claim_pk =
-        PublicKey::from(addr1_xonly.public_key(bdk_wallet::bitcoin::secp256k1::Parity::Even));
-
-    let mut sigs = BTreeMap::new();
-    sigs.insert((claim_pk, leaf_hash), taproot_sig);
-
-    let mut preimages = BTreeMap::new();
-    preimages.insert(payment_hash, preimage);
-
-    let mut control_blocks = BTreeMap::new();
-    control_blocks.insert(
-        claim_control_block.clone(),
-        (claim_leaf_script.clone(), LeafVersion::TapScript),
-    );
-
-    let satisfier = ClaimSatisfier {
-        sigs,
-        preimages,
-        control_blocks,
-    };
-
-    // ── htlc_descriptor の DefiniteDescriptor（Descriptor<PublicKey>）を得る ─
-    //
-    //  definite_htlc は Descriptor<bitcoin::PublicKey> なので
-    //  Satisfier<bitcoin::PublicKey> を実装する必要がある。
-    //
-    //  at_derivation_index(0) → DefiniteDescriptorKey を確定
-    //  derived_descriptor(secp) → Descriptor<bitcoin::PublicKey>
-    //  これに対して get_satisfaction(satisfier) を呼ぶ。
-    let secp = wallet.secp_ctx();
-    let htlc_definite = htlc_derived.derived_descriptor(secp)?;
-
-    // get_satisfaction() → (witness_stack: Vec<Vec<u8>>, _script_sig: ScriptBuf)
-    let (witness_stack, _script_sig) = htlc_definite.get_satisfaction(satisfier)?;
-
-    // witness を spend_tx に設定
-    spend_tx.input[0].witness = Witness::from_slice(&witness_stack);
+    let witness =
+        htlc.witness_stack_for_claim(&wallet, &htlc_descriptor, &spend_tx, txout.clone())?;
+    spend_tx.input[0].witness = Witness::from_slice(&witness);
+    println!("spend_tx: {}", hex::encode(serialize(&spend_tx)));
 
     // ── 結果表示 ─────────────────────────────────────────────────────────
     let witness = &spend_tx.input[0].witness;
@@ -261,23 +108,22 @@ fn main() -> anyhow::Result<()> {
         );
     }
 
-    // ── 署名を再検証 ─────────────────────────────────────────────────────
-    secp.verify_schnorr(
-        &sig,
-        &bdk_wallet::bitcoin::secp256k1::Message::from_digest(sighash.to_byte_array()),
-        &addr1_xonly,
-    )
-    .map_err(|e| anyhow::anyhow!("sig verify failed: {e}"))?;
+    // // ── 署名を再検証 ─────────────────────────────────────────────────────
+    // secp.verify_schnorr(
+    //     &sig,
+    //     &bdk_wallet::bitcoin::secp256k1::Message::from_digest(sighash.to_byte_array()),
+    //     &addr1_xonly,
+    // )
+    // .map_err(|e| anyhow::anyhow!("sig verify failed: {e}"))?;
 
-    println!("\n✓ Schnorr 署名の検証 OK");
-    println!(
-        "✓ witness: [sig({} B), preimage({} B), leaf_script({} B), control_block({} B)]",
-        witness.nth(0).map(|x| x.len()).unwrap_or(0),
-        witness.nth(1).map(|x| x.len()).unwrap_or(0),
-        witness.nth(2).map(|x| x.len()).unwrap_or(0),
-        witness.nth(3).map(|x| x.len()).unwrap_or(0),
-    );
-    println!("spend_tx: {}", hex::encode(serialize(&spend_tx)));
+    // println!("\n✓ Schnorr 署名の検証 OK");
+    // println!(
+    //     "✓ witness: [sig({} B), preimage({} B), leaf_script({} B), control_block({} B)]",
+    //     witness.nth(0).map(|x| x.len()).unwrap_or(0),
+    //     witness.nth(1).map(|x| x.len()).unwrap_or(0),
+    //     witness.nth(2).map(|x| x.len()).unwrap_or(0),
+    //     witness.nth(3).map(|x| x.len()).unwrap_or(0),
+    // );
 
     let _ = watch_address(&mut wallet, &addr1);
     println!("TX detected.");
@@ -395,35 +241,4 @@ fn convert_descriptor(
         }
     };
     Ok(xonly)
-}
-
-fn sign_shnorr(
-    wallet: &Wallet,
-    addr_claim_info: &bdk_wallet::AddressInfo,
-    msg: &Message,
-) -> anyhow::Result<Signature> {
-    let secp = wallet.secp_ctx();
-    let signers = wallet.get_signers(KeychainKind::External);
-    let dsk = signers
-        .signers()
-        .iter()
-        .find_map(|&s| s.descriptor_secret_key())
-        .ok_or_else(|| anyhow::anyhow!("no secret key in wallet"))?;
-
-    let sec_key = match dsk {
-        bdk_wallet::keys::DescriptorSecretKey::XPrv(xkey) => {
-            // xkey.xkey        : ExtendedPrivKey（descriptor のルート鍵 tprv...）
-            // xkey.derivation_path: /86'/1'/0'/0 部分
-            // derive_priv でそこまで降りてから、wildcard の index を追加で derive する
-            let child = ChildNumber::from_normal_idx(addr_claim_info.index)?;
-            let mut path_vec: Vec<ChildNumber> =
-                xkey.derivation_path.into_iter().copied().collect();
-            path_vec.push(child);
-            let full_path = DerivationPath::from(path_vec);
-            xkey.xkey.derive_priv(secp, &full_path)?.private_key
-        }
-        _ => anyhow::bail!("expected xprv signer"),
-    };
-    let keypair = Keypair::from_secret_key(secp, &sec_key);
-    Ok(secp.sign_schnorr(msg, &keypair))
 }
