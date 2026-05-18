@@ -7,6 +7,7 @@ use bdk_wallet::{
         bip32::{self, ChildNumber, DerivationPath},
         hashes::{Hash, sha256},
         key::Keypair,
+        relative::LockTime,
         secp256k1::{Message, XOnlyPublicKey, schnorr::Signature},
         sighash::{Prevouts, SighashCache},
         taproot::{ControlBlock, LeafVersion, Signature as TaprootSig},
@@ -180,8 +181,6 @@ impl Htlc {
             }
         }
 
-        // Satisfier<PublicKey> のキーは bitcoin::PublicKey（compressed 33-byte）
-        // claim_xonly → bitcoin::PublicKey へ変換（Taproot は even parity と仮定）
         let claim_pk =
             PublicKey::from(claim_xonly.public_key(bdk_wallet::bitcoin::secp256k1::Parity::Even));
 
@@ -201,6 +200,111 @@ impl Htlc {
             sigs,
             preimages,
             control_blocks,
+        };
+
+        let secp = wallet.secp_ctx();
+        let htlc_definite = htlc_derived.derived_descriptor(secp)?;
+        let (witness_stack, _script_sig) = htlc_definite.get_satisfaction(satisfier)?;
+        Ok(witness_stack)
+    }
+
+    pub fn witness_stack_for_refund(
+        &self,
+        wallet: &Wallet,
+        htlc_descriptor: &Descriptor<DescriptorPublicKey>,
+        spend_tx: &Transaction,
+        txout: TxOut,
+    ) -> Result<Vec<Vec<u8>>, HtlcError> {
+        let refund_xonly = convert_descriptor(wallet, &self.refund_addrinfo)?;
+        let htlc_derived = htlc_descriptor.at_derivation_index(0)?;
+
+        let (refund_leaf_script, refund_control_block): (ScriptBuf, ControlBlock) =
+            match &htlc_derived {
+                Descriptor::Tr(tr) => {
+                    let spend_info = tr.spend_info();
+                    let xonly_bytes = refund_xonly.serialize();
+                    spend_info
+                        .script_map()
+                        .keys()
+                        .find_map(|(script, ver)| {
+                            if script.as_bytes().windows(32).any(|w| w == xonly_bytes) {
+                                spend_info
+                                    .control_block(&(script.clone(), *ver))
+                                    .map(|cb| (script.clone(), cb))
+                            } else {
+                                None
+                            }
+                        })
+                        .ok_or_else(|| HtlcError::WitnessError("refund leaf not found".into()))?
+                }
+                _ => {
+                    return Err(HtlcError::WitnessError(
+                        "expected Taproot descriptor".into(),
+                    ));
+                }
+            };
+
+        let leaf_hash = TapLeafHash::from_script(&refund_leaf_script, LeafVersion::TapScript);
+
+        let prevouts = [txout];
+        let mut sighash_cache = SighashCache::new(spend_tx);
+        let sighash = sighash_cache.taproot_script_spend_signature_hash(
+            0,
+            &Prevouts::All(&prevouts),
+            leaf_hash,
+            TapSighashType::Default,
+        )?;
+
+        let msg = bdk_wallet::bitcoin::secp256k1::Message::from_digest(sighash.to_byte_array());
+        let sig = sign_shnorr(wallet, &self.refund_addrinfo, &msg)?;
+
+        let taproot_sig = TaprootSig {
+            signature: sig,
+            sighash_type: TapSighashType::Default,
+        };
+
+        struct RefundSatisfier {
+            sigs: BTreeMap<(PublicKey, TapLeafHash), TaprootSig>,
+            control_blocks: BTreeMap<ControlBlock, (ScriptBuf, LeafVersion)>,
+            sequence: u32,
+        }
+
+        impl Satisfier<PublicKey> for RefundSatisfier {
+            fn lookup_tap_leaf_script_sig(
+                &self,
+                pk: &PublicKey,
+                lh: &TapLeafHash,
+            ) -> Option<TaprootSig> {
+                self.sigs.get(&(*pk, *lh)).copied()
+            }
+
+            fn lookup_tap_control_block_map(
+                &self,
+            ) -> Option<&BTreeMap<ControlBlock, (ScriptBuf, LeafVersion)>> {
+                Some(&self.control_blocks)
+            }
+
+            fn check_older(&self, csv: LockTime) -> bool {
+                csv.to_consensus_u32() >= self.sequence
+            }
+        }
+
+        let refund_pk =
+            PublicKey::from(refund_xonly.public_key(bdk_wallet::bitcoin::secp256k1::Parity::Even));
+
+        let mut sigs = BTreeMap::new();
+        sigs.insert((refund_pk, leaf_hash), taproot_sig);
+
+        let mut control_blocks = BTreeMap::new();
+        control_blocks.insert(
+            refund_control_block.clone(),
+            (refund_leaf_script.clone(), LeafVersion::TapScript),
+        );
+
+        let satisfier = RefundSatisfier {
+            sigs,
+            control_blocks,
+            sequence: spend_tx.input[0].sequence.to_consensus_u32(),
         };
 
         let secp = wallet.secp_ctx();
@@ -230,7 +334,7 @@ fn convert_descriptor(
 
 fn sign_shnorr(
     wallet: &Wallet,
-    addr_claim_info: &bdk_wallet::AddressInfo,
+    addr_info: &bdk_wallet::AddressInfo,
     msg: &Message,
 ) -> Result<Signature, HtlcError> {
     let secp = wallet.secp_ctx();
@@ -243,10 +347,7 @@ fn sign_shnorr(
 
     let sec_key = match dsk {
         bdk_wallet::keys::DescriptorSecretKey::XPrv(xkey) => {
-            // xkey.xkey        : ExtendedPrivKey（descriptor のルート鍵 tprv...）
-            // xkey.derivation_path: /86'/1'/0'/0 部分
-            // derive_priv でそこまで降りてから、wildcard の index を追加で derive する
-            let child = ChildNumber::from_normal_idx(addr_claim_info.index)?;
+            let child = ChildNumber::from_normal_idx(addr_info.index)?;
             let mut path_vec: Vec<ChildNumber> =
                 xkey.derivation_path.into_iter().copied().collect();
             path_vec.push(child);

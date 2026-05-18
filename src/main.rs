@@ -9,11 +9,9 @@ use bdk_wallet::{
         bip32::Xpriv,
         consensus::serialize,
         key::rand::{self, RngCore},
-        secp256k1::XOnlyPublicKey,
         transaction,
     },
     chain::spk_client::{SyncRequest, SyncRequestBuilder},
-    miniscript::Descriptor,
     template::{Bip86, DescriptorTemplate},
 };
 
@@ -25,6 +23,7 @@ const BATCH_SIZE: usize = 5;
 const NETWORK: Network = Network::Regtest;
 const WATCH_DURATION_SECS: u64 = 1;
 
+const HTLC_CSV: u32 = 16;
 const ADDR1_INDEX: u32 = 0;
 const ADDR2_INDEX: u32 = 1;
 
@@ -48,7 +47,7 @@ fn main() -> anyhow::Result<()> {
     let mut preimage = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut preimage);
 
-    let htlc = Htlc::new(preimage.to_vec(), 16, addr1.clone(), addr2.clone())?;
+    let htlc = Htlc::new(preimage.to_vec(), HTLC_CSV, addr1.clone(), addr2.clone())?;
     let htlc_descriptor = htlc.generate_descriptor(&wallet)?;
     let htlc_derived = htlc_descriptor.at_derivation_index(0)?;
     let htlc_address = htlc_derived.address(NETWORK)?;
@@ -79,7 +78,7 @@ fn main() -> anyhow::Result<()> {
         input: vec![TxIn {
             previous_output: prev_output,
             script_sig: ScriptBuf::new(),
-            sequence: Sequence::MAX,
+            sequence: Sequence(HTLC_CSV),
             witness: Witness::default(),
         }],
         output: vec![transaction::TxOut {
@@ -88,8 +87,22 @@ fn main() -> anyhow::Result<()> {
         }],
     };
 
-    let witness =
-        htlc.witness_stack_for_claim(&wallet, &htlc_descriptor, &spend_tx, txout.clone())?;
+    // let witness =
+    //     htlc.witness_stack_for_claim(&wallet, &htlc_descriptor, &spend_tx, txout.clone())?;
+    let witness;
+    loop {
+        match htlc.witness_stack_for_refund(&wallet, &htlc_descriptor, &spend_tx, txout.clone()) {
+            Ok(v) => {
+                witness = v;
+                break;
+            }
+            Err(e) => {
+                println!("{e}");
+                std::thread::sleep(std::time::Duration::from_secs(WATCH_DURATION_SECS));
+                continue;
+            }
+        }
+    }
     spend_tx.input[0].witness = Witness::from_slice(&witness);
     println!("spend_tx: {}", hex::encode(serialize(&spend_tx)));
 
@@ -223,22 +236,4 @@ fn sync_request(
     SyncRequest::builder()
         .chain_tip(chain_tip)
         .spks_with_indexes(spks_to_sync)
-}
-
-fn convert_descriptor(
-    wallet: &Wallet,
-    addr_info: &bdk_wallet::AddressInfo,
-) -> anyhow::Result<XOnlyPublicKey> {
-    let secp = wallet.secp_ctx();
-    let xonly: XOnlyPublicKey = {
-        let desc = wallet
-            .public_descriptor(KeychainKind::External)
-            .at_derivation_index(addr_info.index)?
-            .derived_descriptor(secp)?;
-        match desc {
-            Descriptor::Tr(tr) => tr.internal_key().inner.x_only_public_key().0,
-            _ => anyhow::bail!("expected Taproot descriptor"),
-        }
-    };
-    Ok(xonly)
 }
