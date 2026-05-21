@@ -14,7 +14,9 @@ use bdk_wallet::{
     },
     descriptor,
     keys::DescriptorPublicKey,
-    miniscript::{Descriptor, Preimage32, Satisfier, descriptor::ConversionError},
+    miniscript::{
+        DefiniteDescriptorKey, Descriptor, Preimage32, Satisfier, descriptor::ConversionError,
+    },
 };
 use thiserror::Error;
 
@@ -52,6 +54,40 @@ pub enum HtlcError {
 // TODO H + rG
 // https://github.com/bitcoin/bips/blob/master/bip-0341.mediawiki#constructing-and-spending-taproot-outputs
 const NUMS_XPUBKEY: &str = "50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0";
+
+struct TaprootSpendData {
+    leaf_script: ScriptBuf,
+    control_block: ControlBlock,
+    leaf_hash: TapLeafHash,
+}
+
+struct HtlcSatisfier {
+    sigs: BTreeMap<(PublicKey, TapLeafHash), TaprootSig>,
+    preimages: BTreeMap<sha256::Hash, Preimage32>,
+    control_blocks: BTreeMap<ControlBlock, (ScriptBuf, LeafVersion)>,
+    sequence: Option<u32>,
+}
+
+impl Satisfier<PublicKey> for HtlcSatisfier {
+    fn lookup_tap_leaf_script_sig(&self, pk: &PublicKey, lh: &TapLeafHash) -> Option<TaprootSig> {
+        self.sigs.get(&(*pk, *lh)).copied()
+    }
+
+    fn lookup_sha256(&self, h: &sha256::Hash) -> Option<Preimage32> {
+        self.preimages.get(h).copied()
+    }
+
+    fn lookup_tap_control_block_map(
+        &self,
+    ) -> Option<&BTreeMap<ControlBlock, (ScriptBuf, LeafVersion)>> {
+        Some(&self.control_blocks)
+    }
+
+    fn check_older(&self, csv: LockTime) -> bool {
+        self.sequence
+            .is_some_and(|sequence| csv.to_consensus_u32() >= sequence)
+    }
+}
 
 pub struct Htlc {
     pub preimage: [u8; 32],
@@ -110,102 +146,20 @@ impl Htlc {
         let claim_xonly = convert_descriptor(wallet, &self.claim_addrinfo)?;
         let htlc_derived = htlc_descriptor.at_derivation_index(0)?;
 
-        let (claim_leaf_script, claim_control_block): (ScriptBuf, ControlBlock) =
-            match &htlc_derived {
-                Descriptor::Tr(tr) => {
-                    let spend_info = tr.spend_info();
-                    let xonly_bytes = claim_xonly.serialize();
-                    spend_info
-                        .script_map()
-                        .keys()
-                        .find_map(|(script, ver)| {
-                            if script.as_bytes().windows(32).any(|w| w == xonly_bytes) {
-                                spend_info
-                                    .control_block(&(script.clone(), *ver))
-                                    .map(|cb| (script.clone(), cb))
-                            } else {
-                                None
-                            }
-                        })
-                        .ok_or_else(|| HtlcError::WitnessError("claim leaf not found".into()))?
-                }
-                _ => {
-                    return Err(HtlcError::WitnessError(
-                        "expected Taproot descriptor".into(),
-                    ));
-                }
-            };
-
-        let leaf_hash = TapLeafHash::from_script(&claim_leaf_script, LeafVersion::TapScript);
-
-        let prevouts = [txout];
-        let mut sighash_cache = SighashCache::new(spend_tx);
-        let sighash = sighash_cache.taproot_script_spend_signature_hash(
-            0,
-            &Prevouts::All(&prevouts),
-            leaf_hash,
-            TapSighashType::Default,
-        )?;
-
-        let msg = bdk_wallet::bitcoin::secp256k1::Message::from_digest(sighash.to_byte_array());
-        let sig = sign_shnorr(wallet, &self.claim_addrinfo, &msg)?;
-
-        let taproot_sig = TaprootSig {
-            signature: sig,
-            sighash_type: TapSighashType::Default,
-        };
-
-        struct ClaimSatisfier {
-            sigs: BTreeMap<(PublicKey, TapLeafHash), TaprootSig>,
-            preimages: BTreeMap<sha256::Hash, Preimage32>,
-            control_blocks: BTreeMap<ControlBlock, (ScriptBuf, LeafVersion)>,
-        }
-
-        impl Satisfier<PublicKey> for ClaimSatisfier {
-            fn lookup_tap_leaf_script_sig(
-                &self,
-                pk: &PublicKey,
-                lh: &TapLeafHash,
-            ) -> Option<TaprootSig> {
-                self.sigs.get(&(*pk, *lh)).copied()
-            }
-
-            fn lookup_sha256(&self, h: &sha256::Hash) -> Option<Preimage32> {
-                self.preimages.get(h).copied()
-            }
-
-            fn lookup_tap_control_block_map(
-                &self,
-            ) -> Option<&BTreeMap<ControlBlock, (ScriptBuf, LeafVersion)>> {
-                Some(&self.control_blocks)
-            }
-        }
-
-        let claim_pk =
-            PublicKey::from(claim_xonly.public_key(bdk_wallet::bitcoin::secp256k1::Parity::Even));
-
-        let mut sigs = BTreeMap::new();
-        sigs.insert((claim_pk, leaf_hash), taproot_sig);
-
         let mut preimages = BTreeMap::new();
         preimages.insert(payment_hash, self.preimage);
 
-        let mut control_blocks = BTreeMap::new();
-        control_blocks.insert(
-            claim_control_block.clone(),
-            (claim_leaf_script.clone(), LeafVersion::TapScript),
-        );
-
-        let satisfier = ClaimSatisfier {
-            sigs,
+        self.witness_stack(
+            wallet,
+            &htlc_derived,
+            spend_tx,
+            txout,
+            &self.claim_addrinfo,
+            claim_xonly,
             preimages,
-            control_blocks,
-        };
-
-        let secp = wallet.secp_ctx();
-        let htlc_definite = htlc_derived.derived_descriptor(secp)?;
-        let (witness_stack, _script_sig) = htlc_definite.get_satisfaction(satisfier)?;
-        Ok(witness_stack)
+            None,
+            "claim",
+        )
     }
 
     pub fn witness_stack_for_refund(
@@ -218,93 +172,51 @@ impl Htlc {
         let refund_xonly = convert_descriptor(wallet, &self.refund_addrinfo)?;
         let htlc_derived = htlc_descriptor.at_derivation_index(0)?;
 
-        let (refund_leaf_script, refund_control_block): (ScriptBuf, ControlBlock) =
-            match &htlc_derived {
-                Descriptor::Tr(tr) => {
-                    let spend_info = tr.spend_info();
-                    let xonly_bytes = refund_xonly.serialize();
-                    spend_info
-                        .script_map()
-                        .keys()
-                        .find_map(|(script, ver)| {
-                            if script.as_bytes().windows(32).any(|w| w == xonly_bytes) {
-                                spend_info
-                                    .control_block(&(script.clone(), *ver))
-                                    .map(|cb| (script.clone(), cb))
-                            } else {
-                                None
-                            }
-                        })
-                        .ok_or_else(|| HtlcError::WitnessError("refund leaf not found".into()))?
-                }
-                _ => {
-                    return Err(HtlcError::WitnessError(
-                        "expected Taproot descriptor".into(),
-                    ));
-                }
-            };
+        self.witness_stack(
+            wallet,
+            &htlc_derived,
+            spend_tx,
+            txout,
+            &self.refund_addrinfo,
+            refund_xonly,
+            BTreeMap::new(),
+            Some(spend_tx.input[0].sequence.to_consensus_u32()),
+            "refund",
+        )
+    }
 
-        let leaf_hash = TapLeafHash::from_script(&refund_leaf_script, LeafVersion::TapScript);
+    fn witness_stack(
+        &self,
+        wallet: &Wallet,
+        htlc_derived: &Descriptor<DefiniteDescriptorKey>,
+        spend_tx: &Transaction,
+        txout: TxOut,
+        addr_info: &AddressInfo,
+        xonly: XOnlyPublicKey,
+        preimages: BTreeMap<sha256::Hash, Preimage32>,
+        sequence: Option<u32>,
+        leaf_name: &str,
+    ) -> Result<Vec<Vec<u8>>, HtlcError> {
+        let spend_data = taproot_spend_data(htlc_derived, xonly, leaf_name)?;
+        let taproot_sig =
+            sign_taproot_script_spend(wallet, addr_info, spend_tx, txout, spend_data.leaf_hash)?;
 
-        let prevouts = [txout];
-        let mut sighash_cache = SighashCache::new(spend_tx);
-        let sighash = sighash_cache.taproot_script_spend_signature_hash(
-            0,
-            &Prevouts::All(&prevouts),
-            leaf_hash,
-            TapSighashType::Default,
-        )?;
-
-        let msg = bdk_wallet::bitcoin::secp256k1::Message::from_digest(sighash.to_byte_array());
-        let sig = sign_shnorr(wallet, &self.refund_addrinfo, &msg)?;
-
-        let taproot_sig = TaprootSig {
-            signature: sig,
-            sighash_type: TapSighashType::Default,
-        };
-
-        struct RefundSatisfier {
-            sigs: BTreeMap<(PublicKey, TapLeafHash), TaprootSig>,
-            control_blocks: BTreeMap<ControlBlock, (ScriptBuf, LeafVersion)>,
-            sequence: u32,
-        }
-
-        impl Satisfier<PublicKey> for RefundSatisfier {
-            fn lookup_tap_leaf_script_sig(
-                &self,
-                pk: &PublicKey,
-                lh: &TapLeafHash,
-            ) -> Option<TaprootSig> {
-                self.sigs.get(&(*pk, *lh)).copied()
-            }
-
-            fn lookup_tap_control_block_map(
-                &self,
-            ) -> Option<&BTreeMap<ControlBlock, (ScriptBuf, LeafVersion)>> {
-                Some(&self.control_blocks)
-            }
-
-            fn check_older(&self, csv: LockTime) -> bool {
-                csv.to_consensus_u32() >= self.sequence
-            }
-        }
-
-        let refund_pk =
-            PublicKey::from(refund_xonly.public_key(bdk_wallet::bitcoin::secp256k1::Parity::Even));
+        let pk = PublicKey::from(xonly.public_key(bdk_wallet::bitcoin::secp256k1::Parity::Even));
 
         let mut sigs = BTreeMap::new();
-        sigs.insert((refund_pk, leaf_hash), taproot_sig);
+        sigs.insert((pk, spend_data.leaf_hash), taproot_sig);
 
         let mut control_blocks = BTreeMap::new();
         control_blocks.insert(
-            refund_control_block.clone(),
-            (refund_leaf_script.clone(), LeafVersion::TapScript),
+            spend_data.control_block,
+            (spend_data.leaf_script, LeafVersion::TapScript),
         );
 
-        let satisfier = RefundSatisfier {
+        let satisfier = HtlcSatisfier {
             sigs,
+            preimages,
             control_blocks,
-            sequence: spend_tx.input[0].sequence.to_consensus_u32(),
+            sequence,
         };
 
         let secp = wallet.secp_ctx();
@@ -312,6 +224,66 @@ impl Htlc {
         let (witness_stack, _script_sig) = htlc_definite.get_satisfaction(satisfier)?;
         Ok(witness_stack)
     }
+}
+
+fn taproot_spend_data(
+    htlc_derived: &Descriptor<DefiniteDescriptorKey>,
+    xonly: XOnlyPublicKey,
+    leaf_name: &str,
+) -> Result<TaprootSpendData, HtlcError> {
+    let Descriptor::Tr(tr) = htlc_derived else {
+        return Err(HtlcError::WitnessError(
+            "expected Taproot descriptor".into(),
+        ));
+    };
+
+    let spend_info = tr.spend_info();
+    let xonly_bytes = xonly.serialize();
+    let (leaf_script, control_block) = spend_info
+        .script_map()
+        .keys()
+        .find_map(|(script, ver)| {
+            if script.as_bytes().windows(32).any(|w| w == xonly_bytes) {
+                spend_info
+                    .control_block(&(script.clone(), *ver))
+                    .map(|cb| (script.clone(), cb))
+            } else {
+                None
+            }
+        })
+        .ok_or_else(|| HtlcError::WitnessError(format!("{leaf_name} leaf not found")))?;
+
+    let leaf_hash = TapLeafHash::from_script(&leaf_script, LeafVersion::TapScript);
+    Ok(TaprootSpendData {
+        leaf_script,
+        control_block,
+        leaf_hash,
+    })
+}
+
+fn sign_taproot_script_spend(
+    wallet: &Wallet,
+    addr_info: &AddressInfo,
+    spend_tx: &Transaction,
+    txout: TxOut,
+    leaf_hash: TapLeafHash,
+) -> Result<TaprootSig, HtlcError> {
+    let prevouts = [txout];
+    let mut sighash_cache = SighashCache::new(spend_tx);
+    let sighash = sighash_cache.taproot_script_spend_signature_hash(
+        0,
+        &Prevouts::All(&prevouts),
+        leaf_hash,
+        TapSighashType::Default,
+    )?;
+
+    let msg = bdk_wallet::bitcoin::secp256k1::Message::from_digest(sighash.to_byte_array());
+    let signature = sign_shnorr(wallet, addr_info, &msg)?;
+
+    Ok(TaprootSig {
+        signature,
+        sighash_type: TapSighashType::Default,
+    })
 }
 
 fn convert_descriptor(
