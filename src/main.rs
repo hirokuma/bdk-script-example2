@@ -1,5 +1,7 @@
 mod htlc;
 
+use std::io::{self, Write};
+
 use bdk_electrum::{BdkElectrumClient, electrum_client, electrum_client::Client};
 use bdk_wallet::{
     KeychainKind, Wallet,
@@ -26,6 +28,11 @@ const WATCH_DURATION_SECS: u64 = 1;
 const HTLC_CSV: u32 = 16;
 const ADDR1_INDEX: u32 = 0;
 const ADDR2_INDEX: u32 = 1;
+
+enum SpendPath {
+    Claim,
+    Refund,
+}
 
 fn main() -> anyhow::Result<()> {
     let seed = create_seed();
@@ -72,44 +79,43 @@ fn main() -> anyhow::Result<()> {
 
     let fee = Amount::from_sat(1000);
     let out_value = Amount::from_sat(txout.value.to_sat() - fee.to_sat());
+    let spend_path = select_spend_path()?;
+    let (destination, sequence) = match spend_path {
+        SpendPath::Claim => (&addr1.address, Sequence::MAX),
+        SpendPath::Refund => (&addr2.address, Sequence(HTLC_CSV)),
+    };
     let mut spend_tx = Transaction {
         version: transaction::Version::TWO,
         lock_time: absolute::LockTime::ZERO,
         input: vec![TxIn {
             previous_output: prev_output,
             script_sig: ScriptBuf::new(),
-            sequence: Sequence(HTLC_CSV),
+            sequence,
             witness: Witness::default(),
         }],
         output: vec![transaction::TxOut {
             value: out_value,
-            script_pubkey: addr1.address.script_pubkey(),
+            script_pubkey: destination.script_pubkey(),
         }],
     };
 
-    // let witness =
-    //     htlc.witness_stack_for_claim(&wallet, &htlc_descriptor, &spend_tx, txout.clone())?;
-    let witness;
-    loop {
-        match htlc.witness_stack_for_refund(&wallet, &htlc_descriptor, &spend_tx, txout.clone()) {
-            Ok(v) => {
-                witness = v;
-                break;
-            }
-            Err(e) => {
-                println!("{e}");
-                std::thread::sleep(std::time::Duration::from_secs(WATCH_DURATION_SECS));
-                continue;
-            }
-        }
-    }
+    let (witness, labels) = match spend_path {
+        SpendPath::Claim => (
+            htlc.witness_stack_for_claim(&wallet, &htlc_descriptor, &spend_tx, txout.clone())?,
+            ["Schnorr sig", "preimage", "leaf script", "control block"].as_slice(),
+        ),
+        SpendPath::Refund => (
+            htlc.witness_stack_for_refund(&wallet, &htlc_descriptor, &spend_tx, txout.clone())?,
+            ["Schnorr sig", "leaf script", "control block"].as_slice(),
+        ),
+    };
+
     spend_tx.input[0].witness = Witness::from_slice(&witness);
     println!("spend_tx: {}", hex::encode(serialize(&spend_tx)));
 
     // ── 結果表示 ─────────────────────────────────────────────────────────
     let witness = &spend_tx.input[0].witness;
     println!("\n  witness stack ({} items):", witness.len());
-    let labels = ["Schnorr sig", "preimage", "leaf script", "control block"];
     for (i, item) in witness.iter().enumerate() {
         let label = labels.get(i).unwrap_or(&"?");
         println!(
@@ -138,10 +144,27 @@ fn main() -> anyhow::Result<()> {
     //     witness.nth(3).map(|x| x.len()).unwrap_or(0),
     // );
 
-    let _ = watch_address(&mut wallet, &addr1);
+    let _ = watch_address(&mut wallet, destination);
     println!("TX detected.");
 
     Ok(())
+}
+
+fn select_spend_path() -> anyhow::Result<SpendPath> {
+    println!("How do you want to solve the HTLC script?");
+    println!("  1: solve with preimage");
+    println!("  2: solve after 16 blocks");
+    print!("Select 1 or 2: ");
+    io::stdout().flush()?;
+
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+
+    match input.trim() {
+        "1" => Ok(SpendPath::Claim),
+        "2" => Ok(SpendPath::Refund),
+        other => anyhow::bail!("invalid selection: {other}. expected 1 or 2"),
+    }
 }
 
 fn create_seed() -> String {
