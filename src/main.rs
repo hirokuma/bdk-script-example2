@@ -54,7 +54,13 @@ fn main() -> anyhow::Result<()> {
     let mut preimage = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut preimage);
 
-    let htlc = Htlc::new(&wallet, preimage.to_vec(), HTLC_CSV, addr1.clone(), addr2.clone())?;
+    let htlc = Htlc::new(
+        &wallet,
+        preimage.to_vec(),
+        HTLC_CSV,
+        addr1.clone(),
+        addr2.clone(),
+    )?;
     let htlc_descriptor = htlc.generate_descriptor()?;
     let htlc_derived = htlc_descriptor.at_derivation_index(0)?;
     let htlc_address = htlc_derived.address(NETWORK)?;
