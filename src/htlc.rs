@@ -4,18 +4,19 @@ use bdk_wallet::{
     AddressInfo, KeychainKind, Wallet,
     bitcoin::{
         PublicKey, ScriptBuf, TapLeafHash, TapSighashType, Transaction, TxOut,
-        bip32::{self, ChildNumber, DerivationPath},
+        bip32::{ChildNumber, DerivationPath, Error as Bip32Error},
         hashes::{Hash, sha256},
-        key::Keypair,
+        key::{Keypair, Secp256k1},
         relative::LockTime,
-        secp256k1::{Message, XOnlyPublicKey, schnorr::Signature},
-        sighash::{Prevouts, SighashCache},
+        secp256k1::{All as Secp256k1All, Message, Parity, XOnlyPublicKey, schnorr::Signature},
+        sighash::{Prevouts, SighashCache, TaprootError},
         taproot::{ControlBlock, LeafVersion, Signature as TaprootSig},
     },
     descriptor,
-    keys::DescriptorPublicKey,
+    keys::{DescriptorPublicKey, DescriptorSecretKey},
     miniscript::{
-        DefiniteDescriptorKey, Descriptor, Preimage32, Satisfier, descriptor::ConversionError,
+        DefiniteDescriptorKey, Descriptor, Error as MiniscriptError, Preimage32, Satisfier,
+        descriptor::ConversionError,
     },
 };
 use thiserror::Error;
@@ -26,16 +27,16 @@ pub enum HtlcError {
     ConvError(#[from] ConversionError),
 
     #[error("descriptor error: {0}")]
-    DescriptorError(#[from] bdk_wallet::descriptor::DescriptorError),
+    DescriptorError(#[from] descriptor::DescriptorError),
 
     #[error("bip32 error: {0}")]
-    Bip32Error(#[from] bip32::Error),
+    Bip32Error(#[from] Bip32Error),
 
     #[error("taproot sighash error: {0}")]
-    TaprootError(#[from] bdk_wallet::bitcoin::sighash::TaprootError),
+    TaprootError(#[from] TaprootError),
 
     #[error("miniscript error: {0}")]
-    MiniscriptError(#[from] bdk_wallet::miniscript::Error),
+    MiniscriptError(#[from] MiniscriptError),
 
     #[error("descriptor error: {0}")]
     NoKey(String),
@@ -89,21 +90,26 @@ impl Satisfier<PublicKey> for HtlcSatisfier {
     }
 }
 
-pub struct Htlc {
+pub struct Htlc<'a> {
+    pub wallet: &'a Wallet,
+    pub secp: &'a Secp256k1<Secp256k1All>,
     pub preimage: [u8; 32],
     pub older_blocks: u32,
     pub claim_addrinfo: AddressInfo,
     pub refund_addrinfo: AddressInfo,
 }
 
-impl Htlc {
+impl<'a> Htlc<'a> {
     pub fn new(
+        wallet: &'a Wallet,
         preimage: Vec<u8>,
         older_blocks: u32,
         claim_addrinfo: AddressInfo,
         refund_addrinfo: AddressInfo,
     ) -> Result<Self, HtlcError> {
         Ok(Self {
+            wallet,
+            secp: wallet.secp_ctx(),
             preimage: preimage
                 .try_into()
                 .map_err(|_| HtlcError::Error("invalid preimage length".into()))?,
@@ -115,11 +121,10 @@ impl Htlc {
 
     pub fn generate_descriptor(
         &self,
-        wallet: &Wallet,
     ) -> Result<Descriptor<DescriptorPublicKey>, HtlcError> {
         let payment_hash: sha256::Hash = sha256::Hash::hash(&self.preimage);
-        let claim_xonly = convert_descriptor(wallet, &self.claim_addrinfo)?;
-        let refund_xonly = convert_descriptor(wallet, &self.refund_addrinfo)?;
+        let claim_xonly = self.convert_descriptor(&self.claim_addrinfo)?;
+        let refund_xonly = self.convert_descriptor(&self.refund_addrinfo)?;
         let intr_ext = DescriptorPublicKey::from_str(NUMS_XPUBKEY)
             .inspect_err(|e| eprintln!("Internal key error: {}", e))
             .unwrap();
@@ -137,20 +142,18 @@ impl Htlc {
 
     pub fn witness_stack_for_claim(
         &self,
-        wallet: &Wallet,
         htlc_descriptor: &Descriptor<DescriptorPublicKey>,
         spend_tx: &Transaction,
         txout: TxOut,
     ) -> Result<Vec<Vec<u8>>, HtlcError> {
         let payment_hash: sha256::Hash = sha256::Hash::hash(&self.preimage);
-        let claim_xonly = convert_descriptor(wallet, &self.claim_addrinfo)?;
+        let claim_xonly = self.convert_descriptor(&self.claim_addrinfo)?;
         let htlc_derived = htlc_descriptor.at_derivation_index(0)?;
 
         let mut preimages = BTreeMap::new();
         preimages.insert(payment_hash, self.preimage);
 
         self.witness_stack(
-            wallet,
             &htlc_derived,
             spend_tx,
             txout,
@@ -164,16 +167,14 @@ impl Htlc {
 
     pub fn witness_stack_for_refund(
         &self,
-        wallet: &Wallet,
         htlc_descriptor: &Descriptor<DescriptorPublicKey>,
         spend_tx: &Transaction,
         txout: TxOut,
     ) -> Result<Vec<Vec<u8>>, HtlcError> {
-        let refund_xonly = convert_descriptor(wallet, &self.refund_addrinfo)?;
+        let refund_xonly = self.convert_descriptor(&self.refund_addrinfo)?;
         let htlc_derived = htlc_descriptor.at_derivation_index(0)?;
 
         self.witness_stack(
-            wallet,
             &htlc_derived,
             spend_tx,
             txout,
@@ -185,9 +186,9 @@ impl Htlc {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn witness_stack(
         &self,
-        wallet: &Wallet,
         htlc_derived: &Descriptor<DefiniteDescriptorKey>,
         spend_tx: &Transaction,
         txout: TxOut,
@@ -199,9 +200,9 @@ impl Htlc {
     ) -> Result<Vec<Vec<u8>>, HtlcError> {
         let spend_data = taproot_spend_data(htlc_derived, xonly, leaf_name)?;
         let taproot_sig =
-            sign_taproot_script_spend(wallet, addr_info, spend_tx, txout, spend_data.leaf_hash)?;
+            self.sign_taproot_script_spend(addr_info, spend_tx, txout, spend_data.leaf_hash)?;
 
-        let pk = PublicKey::from(xonly.public_key(bdk_wallet::bitcoin::secp256k1::Parity::Even));
+        let pk = PublicKey::from(xonly.public_key(Parity::Even));
 
         let mut sigs = BTreeMap::new();
         sigs.insert((pk, spend_data.leaf_hash), taproot_sig);
@@ -219,10 +220,78 @@ impl Htlc {
             sequence,
         };
 
-        let secp = wallet.secp_ctx();
-        let htlc_definite = htlc_derived.derived_descriptor(secp)?;
+        let htlc_definite = htlc_derived.derived_descriptor(self.secp)?;
         let (witness_stack, _script_sig) = htlc_definite.get_satisfaction(satisfier)?;
         Ok(witness_stack)
+    }
+
+    fn convert_descriptor(
+        &self,
+        addr_info: &AddressInfo,
+    ) -> Result<XOnlyPublicKey, HtlcError> {
+        let xonly: XOnlyPublicKey = {
+            let desc = self.wallet
+                .public_descriptor(KeychainKind::External)
+                .at_derivation_index(addr_info.index)?
+                .derived_descriptor(self.secp)?;
+            match desc {
+                Descriptor::Tr(tr) => tr.internal_key().inner.x_only_public_key().0,
+                _ => Err(HtlcError::NoKey("Expected Taproot descriptor".into()))?,
+            }
+        };
+        Ok(xonly)
+    }
+
+    fn sign_taproot_script_spend(
+        &self,
+        addr_info: &AddressInfo,
+        spend_tx: &Transaction,
+        txout: TxOut,
+        leaf_hash: TapLeafHash,
+    ) -> Result<TaprootSig, HtlcError> {
+        let prevouts = [txout];
+        let mut sighash_cache = SighashCache::new(spend_tx);
+        let sighash = sighash_cache.taproot_script_spend_signature_hash(
+            0,
+            &Prevouts::All(&prevouts),
+            leaf_hash,
+            TapSighashType::Default,
+        )?;
+
+        let msg = Message::from_digest(sighash.to_byte_array());
+        let signature = self.sign_shnorr(addr_info, &msg)?;
+
+        Ok(TaprootSig {
+            signature,
+            sighash_type: TapSighashType::Default,
+        })
+    }
+
+    fn sign_shnorr(
+        &self,
+        addr_info: &AddressInfo,
+        msg: &Message,
+    ) -> Result<Signature, HtlcError> {
+        let signers = self.wallet.get_signers(KeychainKind::External);
+        let dsk = signers
+            .signers()
+            .iter()
+            .find_map(|&s| s.descriptor_secret_key())
+            .ok_or_else(|| HtlcError::SignError("no secret key in wallet".into()))?;
+
+        let sec_key = match dsk {
+            DescriptorSecretKey::XPrv(xkey) => {
+                let child = ChildNumber::from_normal_idx(addr_info.index)?;
+                let mut path_vec: Vec<ChildNumber> =
+                    xkey.derivation_path.into_iter().copied().collect();
+                path_vec.push(child);
+                let full_path = DerivationPath::from(path_vec);
+                xkey.xkey.derive_priv(self.secp, &full_path)?.private_key
+            }
+            _ => return Err(HtlcError::SignError("expected xprv signer".into())),
+        };
+        let keypair = Keypair::from_secret_key(self.secp, &sec_key);
+        Ok(self.secp.sign_schnorr(msg, &keypair))
     }
 }
 
@@ -261,73 +330,3 @@ fn taproot_spend_data(
     })
 }
 
-fn sign_taproot_script_spend(
-    wallet: &Wallet,
-    addr_info: &AddressInfo,
-    spend_tx: &Transaction,
-    txout: TxOut,
-    leaf_hash: TapLeafHash,
-) -> Result<TaprootSig, HtlcError> {
-    let prevouts = [txout];
-    let mut sighash_cache = SighashCache::new(spend_tx);
-    let sighash = sighash_cache.taproot_script_spend_signature_hash(
-        0,
-        &Prevouts::All(&prevouts),
-        leaf_hash,
-        TapSighashType::Default,
-    )?;
-
-    let msg = bdk_wallet::bitcoin::secp256k1::Message::from_digest(sighash.to_byte_array());
-    let signature = sign_shnorr(wallet, addr_info, &msg)?;
-
-    Ok(TaprootSig {
-        signature,
-        sighash_type: TapSighashType::Default,
-    })
-}
-
-fn convert_descriptor(
-    wallet: &Wallet,
-    addr_info: &bdk_wallet::AddressInfo,
-) -> Result<XOnlyPublicKey, HtlcError> {
-    let secp = wallet.secp_ctx();
-    let xonly: XOnlyPublicKey = {
-        let desc = wallet
-            .public_descriptor(KeychainKind::External)
-            .at_derivation_index(addr_info.index)?
-            .derived_descriptor(secp)?;
-        match desc {
-            Descriptor::Tr(tr) => tr.internal_key().inner.x_only_public_key().0,
-            _ => Err(HtlcError::NoKey("Expected Taproot descriptor".into()))?,
-        }
-    };
-    Ok(xonly)
-}
-
-fn sign_shnorr(
-    wallet: &Wallet,
-    addr_info: &bdk_wallet::AddressInfo,
-    msg: &Message,
-) -> Result<Signature, HtlcError> {
-    let secp = wallet.secp_ctx();
-    let signers = wallet.get_signers(KeychainKind::External);
-    let dsk = signers
-        .signers()
-        .iter()
-        .find_map(|&s| s.descriptor_secret_key())
-        .ok_or_else(|| HtlcError::SignError("no secret key in wallet".into()))?;
-
-    let sec_key = match dsk {
-        bdk_wallet::keys::DescriptorSecretKey::XPrv(xkey) => {
-            let child = ChildNumber::from_normal_idx(addr_info.index)?;
-            let mut path_vec: Vec<ChildNumber> =
-                xkey.derivation_path.into_iter().copied().collect();
-            path_vec.push(child);
-            let full_path = DerivationPath::from(path_vec);
-            xkey.xkey.derive_priv(secp, &full_path)?.private_key
-        }
-        _ => return Err(HtlcError::SignError("expected xprv signer".into())),
-    };
-    let keypair = Keypair::from_secret_key(secp, &sec_key);
-    Ok(secp.sign_schnorr(msg, &keypair))
-}

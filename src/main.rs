@@ -54,13 +54,13 @@ fn main() -> anyhow::Result<()> {
     let mut preimage = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut preimage);
 
-    let htlc = Htlc::new(preimage.to_vec(), HTLC_CSV, addr1.clone(), addr2.clone())?;
-    let htlc_descriptor = htlc.generate_descriptor(&wallet)?;
+    let htlc = Htlc::new(&wallet, preimage.to_vec(), HTLC_CSV, addr1.clone(), addr2.clone())?;
+    let htlc_descriptor = htlc.generate_descriptor()?;
     let htlc_derived = htlc_descriptor.at_derivation_index(0)?;
     let htlc_address = htlc_derived.address(NETWORK)?;
     println!("HTLC Address: {}", htlc_address);
 
-    let tx = watch_address(&mut wallet, &htlc_address);
+    let tx = watch_address(&wallet, &htlc_address);
     let txid = tx.compute_txid();
     let (index, txout) = match tx
         .output
@@ -101,11 +101,11 @@ fn main() -> anyhow::Result<()> {
 
     let (witness, labels) = match spend_path {
         SpendPath::Claim => (
-            htlc.witness_stack_for_claim(&wallet, &htlc_descriptor, &spend_tx, txout.clone())?,
+            htlc.witness_stack_for_claim(&htlc_descriptor, &spend_tx, txout.clone())?,
             ["Schnorr sig", "preimage", "leaf script", "control block"].as_slice(),
         ),
         SpendPath::Refund => (
-            htlc.witness_stack_for_refund(&wallet, &htlc_descriptor, &spend_tx, txout.clone())?,
+            htlc.witness_stack_for_refund(&htlc_descriptor, &spend_tx, txout.clone())?,
             ["Schnorr sig", "leaf script", "control block"].as_slice(),
         ),
     };
@@ -144,7 +144,7 @@ fn main() -> anyhow::Result<()> {
     //     witness.nth(3).map(|x| x.len()).unwrap_or(0),
     // );
 
-    let _ = watch_address(&mut wallet, destination);
+    let _ = watch_address(&wallet, destination);
     println!("TX detected.");
 
     Ok(())
@@ -208,7 +208,7 @@ fn full_scan(wallet: &mut Wallet) {
     wallet.apply_update(update).expect("Failed to apply update");
 }
 
-fn watch_address(wallet: &mut Wallet, addr: &Address) -> Transaction {
+fn watch_address(wallet: &Wallet, addr: &Address) -> Transaction {
     let client: BdkElectrumClient<Client> = BdkElectrumClient::new(
         electrum_client::Client::new(ELECTRUM_SERVER).expect("Failed to create Electrum client"),
     );
