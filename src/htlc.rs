@@ -1,27 +1,14 @@
 use std::{collections::BTreeMap, result::Result, str::FromStr};
 
 use bdk_wallet::{
-    AddressInfo, KeychainKind, Wallet,
-    bitcoin::{
-        Address, Amount, Network, OutPoint, PublicKey, ScriptBuf, Sequence, TapLeafHash,
-        TapSighashType, Transaction, TxIn, TxOut, Witness, absolute,
-        bip32::{ChildNumber, DerivationPath, Error as Bip32Error},
-        hashes::{Hash, sha256},
-        key::{
+    AddressInfo, KeychainKind, Wallet, bitcoin::{
+        Address, Amount, Network, OutPoint, PublicKey, ScriptBuf, Sequence, TapLeafHash, TapSighashType, Transaction, TxIn, TxOut, Witness, absolute, bip32::{ChildNumber, DerivationPath, Error as Bip32Error}, hashes::{Hash, sha256}, key::{
             Keypair, Secp256k1,
             rand::{self, RngCore},
-        },
-        relative::LockTime,
-        secp256k1::{
+        }, relative::LockTime, secp256k1::{
             self, All as Secp256k1All, Message, Parity, XOnlyPublicKey, schnorr::Signature,
-        },
-        sighash::{Prevouts, SighashCache, TaprootError},
-        taproot::{ControlBlock, LeafVersion, Signature as TaprootSig},
-        transaction,
-    },
-    descriptor::DescriptorError,
-    keys::{DescriptorPublicKey, DescriptorSecretKey},
-    miniscript::{
+        }, sighash::{Prevouts, SighashCache, TaprootError}, taproot::{ControlBlock, LeafVersion, Signature as TaprootSig}, transaction,
+    }, descriptor::DescriptorError, keys::{DescriptorPublicKey, DescriptorSecretKey}, miniscript::{
         DefiniteDescriptorKey, Descriptor, Error as MiniscriptError, Preimage32, Satisfier,
         descriptor::{ConversionError, DescriptorKeyParseError},
     },
@@ -177,22 +164,41 @@ impl<'a> Htlc<'a> {
                 witness: Witness::default(),
             }],
             output: vec![transaction::TxOut {
-                value: prev_txout.value - Amount::from_sat(1000), // fee計算後に設定
+                value: Amount::ZERO, // fee計算後に設定
                 script_pubkey: ScriptBuf::new_p2tr(&self.secp, self.claim_xonly_pubkey, None),
             }],
         };
 
+        // dummy witness stack for calculate fee
         let witness = self.witness_stack(
-            Some(preimage),
+            true, // dummy
             &spend_tx,
             vin_index,
             prev_txout,
             self.claim_addr_index,
             self.claim_xonly_pubkey,
+            Some(preimage),
             None,
             "claim",
         )?;
         spend_tx.input[vin_index].witness = Witness::from_slice(&witness);
+
+        let fee = fee_from_rate(fee_rate, spend_tx.vsize());
+        spend_tx.output[0].value = prev_txout.value - fee;
+
+        let witness = self.witness_stack(
+            false,
+            &spend_tx,
+            vin_index,
+            prev_txout,
+            self.claim_addr_index,
+            self.claim_xonly_pubkey,
+            Some(preimage),
+            None,
+            "claim",
+        )?;
+        spend_tx.input[vin_index].witness = Witness::from_slice(&witness);
+
         Ok(spend_tx)
     }
 
@@ -209,38 +215,57 @@ impl<'a> Htlc<'a> {
             input: vec![TxIn {
                 previous_output: prev_outpoint,
                 script_sig: ScriptBuf::new(),
-                sequence: Sequence::MAX,
+                sequence: Sequence(self.csv_blocks),
                 witness: Witness::default(),
             }],
             output: vec![transaction::TxOut {
-                value: prev_txout.value - Amount::from_sat(1000), // fee計算後に設定
-                script_pubkey: ScriptBuf::new_p2tr(&self.secp, self.claim_xonly_pubkey, None),
+                value: Amount::ZERO, // fee計算後に設定
+                script_pubkey: ScriptBuf::new_p2tr(&self.secp, self.refund_xonly_pubkey, None),
             }],
         };
 
         let witness = self.witness_stack(
-            None,
+            true, // dummy
             &spend_tx,
             vin_index,
             prev_txout,
             self.refund_addr_index,
             self.refund_xonly_pubkey,
+            None,
             Some(spend_tx.input[vin_index].sequence.to_consensus_u32()),
             "refund",
         )?;
         spend_tx.input[vin_index].witness = Witness::from_slice(&witness);
+
+        let fee = fee_from_rate(fee_rate, spend_tx.vsize());
+        spend_tx.output[0].value = prev_txout.value - fee;
+
+        let witness = self.witness_stack(
+            false,
+            &spend_tx,
+            vin_index,
+            prev_txout,
+            self.refund_addr_index,
+            self.refund_xonly_pubkey,
+            None,
+            Some(spend_tx.input[vin_index].sequence.to_consensus_u32()),
+            "refund",
+        )?;
+        spend_tx.input[vin_index].witness = Witness::from_slice(&witness);
+
         Ok(spend_tx)
     }
 
     #[allow(clippy::too_many_arguments)]
     fn witness_stack(
         &self,
-        preimage: Option<[u8; 32]>,
+        is_dummy: bool,
         spend_tx: &Transaction,
         vin_index: usize,
         prev_txout: &TxOut,
         addr_index: u32,
         xonly_pubkey: XOnlyPublicKey,
+        preimage: Option<[u8; 32]>,
         sequence: Option<u32>,
         leaf_name: &str,
     ) -> Result<Vec<Vec<u8>>, HtlcError> {
@@ -254,6 +279,7 @@ impl<'a> Htlc<'a> {
 
         let spend_data = build_taproot_leaf_spend_data(&self.derived, xonly_pubkey, leaf_name)?;
         let taproot_sig = self.sign_taproot_script_spend(
+            is_dummy,
             addr_index,
             spend_tx,
             vin_index,
@@ -291,12 +317,20 @@ impl<'a> Htlc<'a> {
 
     fn sign_taproot_script_spend(
         &self,
+        is_dummy: bool,
         addr_index: u32,
         spend_tx: &Transaction,
         vin_index: usize,
         prev_txout: &TxOut,
         leaf_hash: TapLeafHash,
     ) -> Result<TaprootSig, HtlcError> {
+        if is_dummy {
+            let dummy = Signature::from_slice(&[0u8; 64]).unwrap();
+            return Ok(TaprootSig {
+                signature: dummy,
+                sighash_type: TapSighashType::Default,
+            });
+        }
         let prevouts = [prev_txout];
         let mut sighash_cache = SighashCache::new(spend_tx);
         let sighash = sighash_cache
@@ -432,4 +466,11 @@ fn generate_descriptor(
     )
     .map_err(|e| log_err!(HtlcError::Descriptor(e), "desc! macro"))?;
     Ok(htlc_descriptor)
+}
+
+fn fee_from_rate(fee_rate: f64, vsize: usize) -> Amount {
+    let fee = (fee_rate * vsize as f64 + 0.5) as u64;
+    debug!("fee_rate = {}", fee_rate);
+    debug!("fee = {}", fee);
+    Amount::from_sat(fee)
 }

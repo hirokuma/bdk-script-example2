@@ -14,6 +14,7 @@ use bdk_wallet::{
     chain::spk_client::{SyncRequest, SyncRequestBuilder},
     template::{Bip86, DescriptorTemplate},
 };
+use tracing_subscriber::{EnvFilter, prelude::*};
 
 use htlc::Htlc;
 
@@ -33,6 +34,16 @@ enum SpendPath {
 }
 
 fn main() -> anyhow::Result<()> {
+    let filter = EnvFilter::builder().parse_lossy("debug");
+    tracing_subscriber::Registry::default()
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_file(true)
+                .with_line_number(true)
+                .with_filter(filter),
+        )
+        .init();
+
     // preimageを後で取得する受取先
     // 正常に処理されて受け取ることを期待するアドレス(claim)
     let seed1 = create_seed();
