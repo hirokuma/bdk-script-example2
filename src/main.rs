@@ -27,7 +27,7 @@ const WATCH_DURATION_SECS: u64 = 1;
 
 const HTLC_CSV: u32 = 16;
 const ADDR1_INDEX: u32 = 0;
-const ADDR2_INDEX: u32 = 1;
+const ADDR2_INDEX: u32 = 10;
 
 enum SpendPath {
     Claim,
@@ -35,38 +35,42 @@ enum SpendPath {
 }
 
 fn main() -> anyhow::Result<()> {
-    let seed = create_seed();
-    // let seed = SEED.to_string();
-    println!("Using seed: {}", seed);
+    // preimageを後で取得する受取先
+    // 正常に処理されて受け取ることを期待するアドレス(claim)
+    let seed1 = create_seed();
+    let mut wallet1 = create_wallet(&seed1);
+    full_scan(&mut wallet1);
+    let addr1 = wallet1.peek_address(KeychainKind::External, ADDR1_INDEX);
+    let addr1_desc = htlc::convert_descriptor(&wallet1, &addr1)?;
+    println!("address(claim): {}, index={}", addr1.address, addr1.index);
 
-    let mut wallet = create_wallet(&seed);
-    full_scan(&mut wallet);
+    // 16ブロック後の受取先
+    // 正常に処理されずにタイムアウトして戻されるアドレス(refund)
+    let seed2 = create_seed();
+    let mut wallet2 = create_wallet(&seed2);
+    full_scan(&mut wallet2);
+    let addr2 = wallet2.peek_address(KeychainKind::External, ADDR2_INDEX);
+    let addr2_desc = htlc::convert_descriptor(&wallet2, &addr2)?;
+    println!("address(refund): {}, index={}", addr2.address, addr2.index);
+    let preimage = htlc::generate_preimage();
 
-    // 最初のアドレス（preimage知っている場合の受取先）
-    let addr1 = wallet.peek_address(KeychainKind::External, ADDR1_INDEX);
-    println!("address 1: {}, index={}", addr1.address, addr1.index);
+    let htlc_claim = Htlc::new(&wallet1, preimage.1, HTLC_CSV, addr1_desc, addr2_desc)?;
+    let htlc_refund = Htlc::new(&wallet2, preimage.1, HTLC_CSV, addr1_desc, addr2_desc)?;
 
-    // 2番目のアドレス（16ブロック後の受取先）
-    let addr2 = wallet.peek_address(KeychainKind::External, ADDR2_INDEX);
-    println!("address 2: {}, index={}", addr2.address, addr2.index);
-
-    // preimageとpayment_hashの生成
-    let mut preimage = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut preimage);
-
-    let htlc = Htlc::new(
-        &wallet,
-        preimage.to_vec(),
-        HTLC_CSV,
-        addr1.clone(),
-        addr2.clone(),
-    )?;
-    let htlc_descriptor = htlc.generate_descriptor()?;
+    let htlc_descriptor = htlc_claim.generate_descriptor()?;
     let htlc_derived = htlc_descriptor.at_derivation_index(0)?;
     let htlc_address = htlc_derived.address(NETWORK)?;
     println!("HTLC Address: {}", htlc_address);
 
-    let tx = watch_address(&wallet, &htlc_address);
+    // refundでも同じ情報になる
+    let htlc_descriptor2 = htlc_refund.generate_descriptor()?;
+    assert_eq!(htlc_descriptor, htlc_descriptor2);
+    let htlc_derived2 = htlc_descriptor2.at_derivation_index(0)?;
+    assert_eq!(htlc_derived, htlc_derived2);
+    let htlc_address2 = htlc_derived2.address(NETWORK)?;
+    assert_eq!(htlc_address, htlc_address2);
+
+    let tx = watch_address(&wallet1, &htlc_address);
     let txid = tx.compute_txid();
     let (index, txout) = match tx
         .output
@@ -107,11 +111,22 @@ fn main() -> anyhow::Result<()> {
 
     let (witness, labels) = match spend_path {
         SpendPath::Claim => (
-            htlc.witness_stack_for_claim(&htlc_descriptor, &spend_tx, txout.clone())?,
+            htlc_claim.witness_stack_for_claim(
+                &addr1,
+                &htlc_descriptor,
+                &spend_tx,
+                txout.clone(),
+                preimage.0,
+            )?,
             ["Schnorr sig", "preimage", "leaf script", "control block"].as_slice(),
         ),
         SpendPath::Refund => (
-            htlc.witness_stack_for_refund(&htlc_descriptor, &spend_tx, txout.clone())?,
+            htlc_refund.witness_stack_for_refund(
+                &addr2,
+                &htlc_descriptor,
+                &spend_tx,
+                txout.clone(),
+            )?,
             ["Schnorr sig", "leaf script", "control block"].as_slice(),
         ),
     };
@@ -150,7 +165,7 @@ fn main() -> anyhow::Result<()> {
     //     witness.nth(3).map(|x| x.len()).unwrap_or(0),
     // );
 
-    let _ = watch_address(&wallet, destination);
+    let _ = watch_address(&wallet1, destination);
     println!("TX detected.");
 
     Ok(())
