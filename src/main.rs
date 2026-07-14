@@ -6,12 +6,10 @@ use bdk_electrum::{BdkElectrumClient, electrum_client, electrum_client::Client};
 use bdk_wallet::{
     KeychainKind, Wallet,
     bitcoin::{
-        Address, Amount, Network, NetworkKind, OutPoint, ScriptBuf, Sequence, Transaction, TxIn,
-        Witness, absolute,
+        Address, Network, NetworkKind, OutPoint, Transaction,
         bip32::Xpriv,
         consensus::serialize,
         key::rand::{self, RngCore},
-        transaction,
     },
     chain::spk_client::{SyncRequest, SyncRequestBuilder},
     template::{Bip86, DescriptorTemplate},
@@ -66,19 +64,25 @@ fn main() -> anyhow::Result<()> {
     let addr2_xonly_pubkey = htlc::xonly_pubkey(&addr2_xonly_pubkey_str)?;
 
     let preimage = htlc::generate_preimage();
+    println!("preimage: {}", hex::encode(preimage.0));
+    println!("preimage_hash: {}", hex::encode(preimage.1));
 
     let htlc_claim = Htlc::new(
         &wallet1,
         preimage.1,
         HTLC_CSV,
+        addr1.index,
         addr1_xonly_pubkey,
+        addr2.index,
         addr2_xonly_pubkey,
     )?;
     let htlc_refund = Htlc::new(
         &wallet2,
         preimage.1,
         HTLC_CSV,
+        addr1.index,
         addr1_xonly_pubkey,
+        addr2.index,
         addr2_xonly_pubkey,
     )?;
 
@@ -91,7 +95,7 @@ fn main() -> anyhow::Result<()> {
 
     let tx = watch_address(&wallet1, &htlc_address);
     let txid = tx.compute_txid();
-    let (index, txout) = match tx
+    let (index, prev_txout) = match tx
         .output
         .iter()
         .enumerate()
@@ -100,54 +104,32 @@ fn main() -> anyhow::Result<()> {
         Some(res) => res,
         None => anyhow::bail!("HTLC output not found in the transaction"),
     };
-    let prev_output = OutPoint {
+    let prev_outpoint = OutPoint {
         txid,
         vout: index as u32,
     };
-    println!("Spendable outpoint: {}", prev_output);
+    println!("Spendable outpoint: {}", prev_outpoint);
 
-    let fee = Amount::from_sat(1000);
-    let out_value = Amount::from_sat(txout.value.to_sat() - fee.to_sat());
     let spend_path = select_spend_path(htlc_refund.csv_blocks)?;
-    let (destination, sequence) = match spend_path {
-        SpendPath::Claim => (&addr1.address, Sequence::MAX),
-        SpendPath::Refund => (&addr2.address, Sequence(HTLC_CSV)),
+    let destination = match spend_path {
+        SpendPath::Claim => &addr1.address,
+        SpendPath::Refund => &addr2.address,
     };
-    let mut spend_tx = Transaction {
-        version: transaction::Version::TWO,
-        lock_time: absolute::LockTime::ZERO,
-        input: vec![TxIn {
-            previous_output: prev_output,
-            script_sig: ScriptBuf::new(),
-            sequence,
-            witness: Witness::default(),
-        }],
-        output: vec![transaction::TxOut {
-            value: out_value,
-            script_pubkey: destination.script_pubkey(),
-        }],
+    let spend_tx_vin = 0; // vin#0 固定
+    let spend_tx = match spend_path {
+        SpendPath::Claim => {
+            htlc_claim.create_claim_tx(prev_outpoint, prev_txout, spend_tx_vin, preimage.0, 1.0)?
+        }
+        SpendPath::Refund => {
+            htlc_refund.create_refund_tx(prev_outpoint, prev_txout, spend_tx_vin, 1.0)?
+        }
     };
-    let spend_tx_vin = 0; // outpoint固定
-
-    let (witness, labels) = match spend_path {
-        SpendPath::Claim => (
-            htlc_claim.witness_stack_for_claim(
-                &addr1,
-                &spend_tx,
-                spend_tx_vin,
-                txout.clone(),
-                preimage.0,
-            )?,
-            ["Schnorr sig", "preimage", "leaf script", "control block"].as_slice(),
-        ),
-        SpendPath::Refund => (
-            htlc_refund.witness_stack_for_refund(&addr2, &spend_tx, spend_tx_vin, txout.clone())?,
-            ["Schnorr sig", "leaf script", "control block"].as_slice(),
-        ),
-    };
-
-    spend_tx.input[spend_tx_vin].witness = Witness::from_slice(&witness);
     println!("spend_tx: {}", hex::encode(serialize(&spend_tx)));
+
+    let labels = match spend_path {
+        SpendPath::Claim => ["Schnorr sig", "preimage", "leaf script", "control block"].as_slice(),
+        SpendPath::Refund => ["Schnorr sig", "leaf script", "control block"].as_slice(),
+    };
 
     // ── 結果表示 ─────────────────────────────────────────────────────────
     let witness = &spend_tx.input[spend_tx_vin].witness;

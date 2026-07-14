@@ -1,10 +1,10 @@
 use std::{collections::BTreeMap, result::Result, str::FromStr};
 
-pub use bdk_wallet::bitcoin::Address as BtcAddress;
 use bdk_wallet::{
     AddressInfo, KeychainKind, Wallet,
     bitcoin::{
-        Network, PublicKey, ScriptBuf, TapLeafHash, TapSighashType, Transaction, TxOut,
+        Address, Amount, Network, OutPoint, PublicKey, ScriptBuf, Sequence, TapLeafHash,
+        TapSighashType, Transaction, TxIn, TxOut, Witness, absolute,
         bip32::{ChildNumber, DerivationPath, Error as Bip32Error},
         hashes::{Hash, sha256},
         key::{
@@ -17,6 +17,7 @@ use bdk_wallet::{
         },
         sighash::{Prevouts, SighashCache, TaprootError},
         taproot::{ControlBlock, LeafVersion, Signature as TaprootSig},
+        transaction,
     },
     descriptor::DescriptorError,
     keys::{DescriptorPublicKey, DescriptorSecretKey},
@@ -107,13 +108,16 @@ impl Satisfier<PublicKey> for HtlcSatisfier {
 }
 
 pub struct Htlc<'a> {
-    pub wallet: &'a Wallet,
-    pub secp: &'a Secp256k1<Secp256k1All>,
     pub preimage_hash: sha256::Hash,
     pub csv_blocks: u32,
-    pub claim_xonly_pubkey: XOnlyPublicKey,
-    pub refund_xonly_pubkey: XOnlyPublicKey,
 
+    wallet: &'a Wallet,
+    secp: &'a Secp256k1<Secp256k1All>,
+    claim_xonly_pubkey: XOnlyPublicKey,
+    refund_xonly_pubkey: XOnlyPublicKey,
+
+    claim_addr_index: u32,
+    refund_addr_index: u32,
     derived: Descriptor<DefiniteDescriptorKey>,
 }
 
@@ -122,7 +126,9 @@ impl<'a> Htlc<'a> {
         wallet: &'a Wallet,
         preimage_hash: sha256::Hash,
         csv_blocks: u32,
+        claim_addr_index: u32,
         claim_xonly_pubkey: XOnlyPublicKey,
+        refund_addr_index: u32,
         refund_xonly_pubkey: XOnlyPublicKey,
     ) -> Result<Self, HtlcError> {
         let desc = generate_descriptor(
@@ -139,55 +145,91 @@ impl<'a> Htlc<'a> {
             secp: wallet.secp_ctx(),
             preimage_hash,
             csv_blocks,
+            claim_addr_index,
             claim_xonly_pubkey,
+            refund_addr_index,
             refund_xonly_pubkey,
             derived,
         })
     }
 
-    pub fn address(&self, network: Network) -> Result<BtcAddress, HtlcError> {
+    pub fn address(&self, network: Network) -> Result<Address, HtlcError> {
         self.derived
             .address(network)
             .map_err(|e| log_err!(HtlcError::Miniscript(e), "address"))
     }
 
-    pub fn witness_stack_for_claim(
+    pub fn create_claim_tx(
         &self,
-        claim_addrinfo: &AddressInfo,
-        spend_tx: &Transaction,
+        prev_outpoint: OutPoint,
+        prev_txout: &TxOut,
         vin_index: usize,
-        txout: TxOut,
         preimage: [u8; 32],
-    ) -> Result<Vec<Vec<u8>>, HtlcError> {
-        self.witness_stack(
+        fee_rate: f64,
+    ) -> Result<Transaction, HtlcError> {
+        let mut spend_tx = Transaction {
+            version: transaction::Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: prev_outpoint,
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![transaction::TxOut {
+                value: prev_txout.value - Amount::from_sat(1000), // fee計算後に設定
+                script_pubkey: ScriptBuf::new_p2tr(&self.secp, self.claim_xonly_pubkey, None),
+            }],
+        };
+
+        let witness = self.witness_stack(
             Some(preimage),
-            spend_tx,
+            &spend_tx,
             vin_index,
-            txout,
-            claim_addrinfo,
+            prev_txout,
+            self.claim_addr_index,
             self.claim_xonly_pubkey,
             None,
             "claim",
-        )
+        )?;
+        spend_tx.input[vin_index].witness = Witness::from_slice(&witness);
+        Ok(spend_tx)
     }
 
-    pub fn witness_stack_for_refund(
+    pub fn create_refund_tx(
         &self,
-        refund_addrinfo: &AddressInfo,
-        spend_tx: &Transaction,
+        prev_outpoint: OutPoint,
+        prev_txout: &TxOut,
         vin_index: usize,
-        txout: TxOut,
-    ) -> Result<Vec<Vec<u8>>, HtlcError> {
-        self.witness_stack(
+        fee_rate: f64,
+    ) -> Result<Transaction, HtlcError> {
+        let mut spend_tx = Transaction {
+            version: transaction::Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: prev_outpoint,
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![transaction::TxOut {
+                value: prev_txout.value - Amount::from_sat(1000), // fee計算後に設定
+                script_pubkey: ScriptBuf::new_p2tr(&self.secp, self.claim_xonly_pubkey, None),
+            }],
+        };
+
+        let witness = self.witness_stack(
             None,
-            spend_tx,
+            &spend_tx,
             vin_index,
-            txout,
-            refund_addrinfo,
+            prev_txout,
+            self.refund_addr_index,
             self.refund_xonly_pubkey,
             Some(spend_tx.input[vin_index].sequence.to_consensus_u32()),
             "refund",
-        )
+        )?;
+        spend_tx.input[vin_index].witness = Witness::from_slice(&witness);
+        Ok(spend_tx)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -196,8 +238,8 @@ impl<'a> Htlc<'a> {
         preimage: Option<[u8; 32]>,
         spend_tx: &Transaction,
         vin_index: usize,
-        txout: TxOut,
-        addr_info: &AddressInfo,
+        prev_txout: &TxOut,
+        addr_index: u32,
         xonly_pubkey: XOnlyPublicKey,
         sequence: Option<u32>,
         leaf_name: &str,
@@ -212,10 +254,10 @@ impl<'a> Htlc<'a> {
 
         let spend_data = build_taproot_leaf_spend_data(&self.derived, xonly_pubkey, leaf_name)?;
         let taproot_sig = self.sign_taproot_script_spend(
-            addr_info,
+            addr_index,
             spend_tx,
             vin_index,
-            txout,
+            prev_txout,
             spend_data.leaf_hash,
         )?;
 
@@ -249,13 +291,13 @@ impl<'a> Htlc<'a> {
 
     fn sign_taproot_script_spend(
         &self,
-        addr_info: &AddressInfo,
+        addr_index: u32,
         spend_tx: &Transaction,
         vin_index: usize,
-        txout: TxOut,
+        prev_txout: &TxOut,
         leaf_hash: TapLeafHash,
     ) -> Result<TaprootSig, HtlcError> {
-        let prevouts = [txout];
+        let prevouts = [prev_txout];
         let mut sighash_cache = SighashCache::new(spend_tx);
         let sighash = sighash_cache
             .taproot_script_spend_signature_hash(
@@ -267,7 +309,7 @@ impl<'a> Htlc<'a> {
             .map_err(|e| log_err!(HtlcError::Taproot(e), "taproot_script_spend_signature_hash"))?;
 
         let msg = Message::from_digest(sighash.to_byte_array());
-        let signature = self.sign_schnorr(addr_info, &msg)?;
+        let signature = self.sign_schnorr(addr_index, &msg)?;
 
         Ok(TaprootSig {
             signature,
@@ -275,7 +317,7 @@ impl<'a> Htlc<'a> {
         })
     }
 
-    fn sign_schnorr(&self, addr_info: &AddressInfo, msg: &Message) -> Result<Signature, HtlcError> {
+    fn sign_schnorr(&self, addr_index: u32, msg: &Message) -> Result<Signature, HtlcError> {
         let signers = self.wallet.get_signers(KeychainKind::External);
         let xprv = signers
             .signers()
@@ -286,7 +328,7 @@ impl<'a> Htlc<'a> {
             })
             .ok_or_else(|| log_err!(HtlcError::Sign, "no secret key in wallet"))?;
 
-        let child = ChildNumber::from_normal_idx(addr_info.index)
+        let child = ChildNumber::from_normal_idx(addr_index)
             .map_err(|e| log_err!(HtlcError::Bip32(e), "from_normal_idx"))?;
         let mut path_vec: Vec<ChildNumber> = xprv.derivation_path.into_iter().copied().collect();
         path_vec.push(child);
