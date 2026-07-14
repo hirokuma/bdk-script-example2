@@ -41,8 +41,14 @@ fn main() -> anyhow::Result<()> {
     let mut wallet1 = create_wallet(&seed1);
     full_scan(&mut wallet1);
     let addr1 = wallet1.peek_address(KeychainKind::External, ADDR1_INDEX);
-    let addr1_desc = htlc::convert_descriptor(&wallet1, &addr1)?;
-    println!("address(claim): {}, index={}", addr1.address, addr1.index);
+    let addr1_xonly_pubkey = htlc::convert_xonly_pubkey(&wallet1, &addr1)?;
+    println!(
+        "address(claim): {}, index={}, xpubkey={}",
+        addr1.address, addr1.index, addr1_xonly_pubkey
+    );
+    // 確認のため作り直しておく
+    let addr1_xonly_pubkey_str = addr1_xonly_pubkey.to_string();
+    let addr1_xonly_pubkey = htlc::xonly_pubkey(&addr1_xonly_pubkey_str)?;
 
     // 16ブロック後の受取先
     // 正常に処理されずにタイムアウトして戻されるアドレス(refund)
@@ -50,24 +56,37 @@ fn main() -> anyhow::Result<()> {
     let mut wallet2 = create_wallet(&seed2);
     full_scan(&mut wallet2);
     let addr2 = wallet2.peek_address(KeychainKind::External, ADDR2_INDEX);
-    let addr2_desc = htlc::convert_descriptor(&wallet2, &addr2)?;
-    println!("address(refund): {}, index={}", addr2.address, addr2.index);
+    let addr2_xonly_pubkey = htlc::convert_xonly_pubkey(&wallet2, &addr2)?;
+    println!(
+        "address(refund): {}, index={}, xpubkey={}",
+        addr2.address, addr2.index, addr2_xonly_pubkey
+    );
+    // 確認のため作り直しておく
+    let addr2_xonly_pubkey_str = addr2_xonly_pubkey.to_string();
+    let addr2_xonly_pubkey = htlc::xonly_pubkey(&addr2_xonly_pubkey_str)?;
+
     let preimage = htlc::generate_preimage();
 
-    let htlc_claim = Htlc::new(&wallet1, preimage.1, HTLC_CSV, addr1_desc, addr2_desc)?;
-    let htlc_refund = Htlc::new(&wallet2, preimage.1, HTLC_CSV, addr1_desc, addr2_desc)?;
+    let htlc_claim = Htlc::new(
+        &wallet1,
+        preimage.1,
+        HTLC_CSV,
+        addr1_xonly_pubkey,
+        addr2_xonly_pubkey,
+    )?;
+    let htlc_refund = Htlc::new(
+        &wallet2,
+        preimage.1,
+        HTLC_CSV,
+        addr1_xonly_pubkey,
+        addr2_xonly_pubkey,
+    )?;
 
-    let htlc_descriptor = htlc_claim.generate_descriptor()?;
-    let htlc_derived = htlc_descriptor.at_derivation_index(0)?;
-    let htlc_address = htlc_derived.address(NETWORK)?;
+    let htlc_address = htlc_claim.address(NETWORK)?;
     println!("HTLC Address: {}", htlc_address);
 
     // refundでも同じ情報になる
-    let htlc_descriptor2 = htlc_refund.generate_descriptor()?;
-    assert_eq!(htlc_descriptor, htlc_descriptor2);
-    let htlc_derived2 = htlc_descriptor2.at_derivation_index(0)?;
-    assert_eq!(htlc_derived, htlc_derived2);
-    let htlc_address2 = htlc_derived2.address(NETWORK)?;
+    let htlc_address2 = htlc_refund.address(NETWORK)?;
     assert_eq!(htlc_address, htlc_address2);
 
     let tx = watch_address(&wallet1, &htlc_address);
@@ -89,7 +108,7 @@ fn main() -> anyhow::Result<()> {
 
     let fee = Amount::from_sat(1000);
     let out_value = Amount::from_sat(txout.value.to_sat() - fee.to_sat());
-    let spend_path = select_spend_path()?;
+    let spend_path = select_spend_path(htlc_refund.csv_blocks)?;
     let (destination, sequence) = match spend_path {
         SpendPath::Claim => (&addr1.address, Sequence::MAX),
         SpendPath::Refund => (&addr2.address, Sequence(HTLC_CSV)),
@@ -108,34 +127,30 @@ fn main() -> anyhow::Result<()> {
             script_pubkey: destination.script_pubkey(),
         }],
     };
+    let spend_tx_vin = 0; // outpoint固定
 
     let (witness, labels) = match spend_path {
         SpendPath::Claim => (
             htlc_claim.witness_stack_for_claim(
                 &addr1,
-                &htlc_descriptor,
                 &spend_tx,
+                spend_tx_vin,
                 txout.clone(),
                 preimage.0,
             )?,
             ["Schnorr sig", "preimage", "leaf script", "control block"].as_slice(),
         ),
         SpendPath::Refund => (
-            htlc_refund.witness_stack_for_refund(
-                &addr2,
-                &htlc_descriptor,
-                &spend_tx,
-                txout.clone(),
-            )?,
+            htlc_refund.witness_stack_for_refund(&addr2, &spend_tx, spend_tx_vin, txout.clone())?,
             ["Schnorr sig", "leaf script", "control block"].as_slice(),
         ),
     };
 
-    spend_tx.input[0].witness = Witness::from_slice(&witness);
+    spend_tx.input[spend_tx_vin].witness = Witness::from_slice(&witness);
     println!("spend_tx: {}", hex::encode(serialize(&spend_tx)));
 
     // ── 結果表示 ─────────────────────────────────────────────────────────
-    let witness = &spend_tx.input[0].witness;
+    let witness = &spend_tx.input[spend_tx_vin].witness;
     println!("\n  witness stack ({} items):", witness.len());
     for (i, item) in witness.iter().enumerate() {
         let label = labels.get(i).unwrap_or(&"?");
@@ -171,10 +186,10 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn select_spend_path() -> anyhow::Result<SpendPath> {
+fn select_spend_path(csv_blocks: u32) -> anyhow::Result<SpendPath> {
     println!("How do you want to solve the HTLC script?");
     println!("  1: solve with preimage");
-    println!("  2: solve after 16 blocks");
+    println!("  2: solve after {} blocks", csv_blocks);
     print!("Select 1 or 2: ");
     io::stdout().flush()?;
 
