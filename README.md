@@ -1,6 +1,9 @@
 # bdk-script-example2
 
-BDKでHTLCを作ってpreimageが必要なルート。
+BDKでHTLCを作ってpreimageが必要なルート。  
+このブランチではP2TRでminiscript/descriptorを使って記述している。
+
+* [https://blog.hirokuma.work/2026/05/20260510-bdk](https://blog.hirokuma.work/2026/05/20260510-bdk)
 
 ## 準備
 
