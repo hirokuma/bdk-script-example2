@@ -1,30 +1,27 @@
-use std::{collections::BTreeMap, result::Result, str::FromStr};
+use std::str::FromStr;
 
 use bdk_wallet::{
     AddressInfo, KeychainKind, Wallet,
     bitcoin::{
-        Address, Amount, Network, OutPoint, PublicKey, ScriptBuf, Sequence, TapLeafHash,
-        TapSighashType, Transaction, TxIn, TxOut, Witness, absolute,
+        Address, Amount, Network, OutPoint, ScriptBuf, Sequence, TapLeafHash, TapSighashType,
+        Transaction, TxIn, TxOut, Witness, absolute,
         bip32::{ChildNumber, DerivationPath, Error as Bip32Error},
         hashes::{Hash, sha256},
         key::{
             Keypair, Secp256k1,
             rand::{self, RngCore},
         },
-        relative::LockTime,
-        secp256k1::{
-            self, All as Secp256k1All, Message, Parity, XOnlyPublicKey, schnorr::Signature,
-        },
+        opcodes,
+        script::Builder,
+        secp256k1::{self, All as Secp256k1All, Message, XOnlyPublicKey, schnorr::Signature},
         sighash::{Prevouts, SighashCache, TaprootError},
-        taproot::{ControlBlock, LeafVersion, Signature as TaprootSig},
+        taproot::{
+            ControlBlock, LeafVersion, Signature as TaprootSig, TaprootBuilder,
+            TaprootBuilderError, TaprootSpendInfo,
+        },
         transaction,
     },
-    descriptor::DescriptorError,
-    keys::{DescriptorPublicKey, DescriptorSecretKey},
-    miniscript::{
-        DefiniteDescriptorKey, Descriptor, Error as MiniscriptError, Preimage32, Satisfier,
-        descriptor::{ConversionError, DescriptorKeyParseError},
-    },
+    keys::DescriptorSecretKey,
 };
 use hex::FromHexError;
 use thiserror::Error;
@@ -38,34 +35,25 @@ pub enum HtlcError {
     FromHex(#[source] FromHexError),
 
     #[error("{0}")]
-    Conversion(#[source] ConversionError),
+    TaprootBuilder(#[source] TaprootBuilderError),
 
-    #[error("{0}")]
-    Descriptor(#[source] DescriptorError),
-
-    #[error("{0}")]
-    DescriptorKeyParse(#[source] DescriptorKeyParseError),
-
-    #[error("{0}")]
-    Bip32(#[source] Bip32Error),
+    #[error("taproot builder is incomplete (no merkle root)")]
+    TaprootBuilderIncomplete,
 
     #[error("{0}")]
     Taproot(#[source] TaprootError),
 
     #[error("{0}")]
-    Miniscript(#[source] MiniscriptError),
-
-    #[error("{0}")]
     Secp(#[source] secp256k1::Error),
 
-    #[error("descriptor error: {0}")]
+    #[error("{0}")]
+    Bip32(#[source] Bip32Error),
+
+    #[error("key error: {0}")]
     NoKey(String),
 
     #[error("witness error: leaf_name={0}")]
     Witness(String),
-
-    #[error("sign error")]
-    Sign,
 }
 
 // pick as internal key a "Nothing Up My Sleeve" (NUMS) point
@@ -73,40 +61,36 @@ pub enum HtlcError {
 // https://github.com/bitcoin/bips/blob/master/bip-0341.mediawiki#constructing-and-spending-taproot-outputs
 const NUMS_XPUBKEY: &str = "50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0";
 
-struct TaprootSpendData {
-    leaf_script: ScriptBuf,
-    control_block: ControlBlock,
+/// taprootのleafスクリプトと、それを使って支払うために必要な情報。
+struct TapLeafSpend {
+    script: ScriptBuf,
     leaf_hash: TapLeafHash,
+    control_block: ControlBlock,
 }
 
-struct HtlcSatisfier {
-    sigs: BTreeMap<(PublicKey, TapLeafHash), TaprootSig>,
-    preimages: BTreeMap<sha256::Hash, Preimage32>,
-    control_blocks: BTreeMap<ControlBlock, (ScriptBuf, LeafVersion)>,
-    sequence: Option<u32>,
+/// 支払い経路。claimはpreimageルート、refundはCSVルート。
+#[derive(Clone, Copy)]
+enum SpendLeaf {
+    Claim,
+    Refund,
 }
 
-impl Satisfier<PublicKey> for HtlcSatisfier {
-    fn lookup_tap_leaf_script_sig(&self, pk: &PublicKey, lh: &TapLeafHash) -> Option<TaprootSig> {
-        self.sigs.get(&(*pk, *lh)).copied()
-    }
-
-    fn lookup_sha256(&self, h: &sha256::Hash) -> Option<Preimage32> {
-        self.preimages.get(h).copied()
-    }
-
-    fn lookup_tap_control_block_map(
-        &self,
-    ) -> Option<&BTreeMap<ControlBlock, (ScriptBuf, LeafVersion)>> {
-        Some(&self.control_blocks)
-    }
-
-    fn check_older(&self, csv: LockTime) -> bool {
-        self.sequence
-            .is_some_and(|sequence| csv.to_consensus_u32() >= sequence)
-    }
-}
-
+/// HTLC。
+/// スクリプトはminiscript / descriptorを使わず、生のオペコードで直接作る。
+/// 内部鍵はNUMSを使う。
+///
+/// claim leaf (73byte)
+/// ```text
+/// OP_SIZE <32> OP_EQUALVERIFY
+/// OP_SHA256 <preimage_hash> OP_EQUALVERIFY
+/// <claim_xonly_pubkey> OP_CHECKSIG
+/// ```
+///
+/// refund leaf (csv_blocks=16で37byte)
+/// ```text
+/// <csv_blocks> OP_CSV OP_DROP
+/// <refund_xonly_pubkey> OP_CHECKSIG
+/// ```
 pub struct Htlc<'a> {
     pub preimage_hash: sha256::Hash,
     pub csv_blocks: u32,
@@ -118,7 +102,10 @@ pub struct Htlc<'a> {
 
     claim_addr_index: u32,
     refund_addr_index: u32,
-    derived: Descriptor<DefiniteDescriptorKey>,
+
+    spend_info: TaprootSpendInfo,
+    claim_leaf: TapLeafSpend,
+    refund_leaf: TapLeafSpend,
 }
 
 impl<'a> Htlc<'a> {
@@ -131,32 +118,42 @@ impl<'a> Htlc<'a> {
         refund_addr_index: u32,
         refund_xonly_pubkey: XOnlyPublicKey,
     ) -> Result<Self, HtlcError> {
-        let desc = generate_descriptor(
-            &preimage_hash,
-            csv_blocks,
-            &claim_xonly_pubkey,
-            &refund_xonly_pubkey,
-        )?;
-        let derived = desc
-            .at_derivation_index(0)
-            .map_err(|e| log_err!(HtlcError::Conversion(e), "new"))?;
+        let secp = wallet.secp_ctx();
+        let internal_key = XOnlyPublicKey::from_str(NUMS_XPUBKEY)
+            .map_err(|e| log_err!(HtlcError::Secp(e), "internal key"))?;
+
+        let claim_script = claim_leaf_script(&preimage_hash, &claim_xonly_pubkey);
+        let refund_script = refund_leaf_script(csv_blocks, &refund_xonly_pubkey);
+
+        // 2つのleafを同じ深さ(=1)に置く
+        let spend_info = TaprootBuilder::new()
+            .add_leaf(1, claim_script.clone())
+            .map_err(|e| log_err!(HtlcError::TaprootBuilder(e), "add claim leaf"))?
+            .add_leaf(1, refund_script.clone())
+            .map_err(|e| log_err!(HtlcError::TaprootBuilder(e), "add refund leaf"))?
+            .finalize(secp, internal_key)
+            .map_err(|_| log_err!(HtlcError::TaprootBuilderIncomplete, "finalize"))?;
+
+        let claim_leaf = leaf_spend(&spend_info, claim_script, "claim")?;
+        let refund_leaf = leaf_spend(&spend_info, refund_script, "refund")?;
+
         Ok(Self {
             wallet,
-            secp: wallet.secp_ctx(),
+            secp,
             preimage_hash,
             csv_blocks,
             claim_addr_index,
             claim_xonly_pubkey,
             refund_addr_index,
             refund_xonly_pubkey,
-            derived,
+            spend_info,
+            claim_leaf,
+            refund_leaf,
         })
     }
 
     pub fn address(&self, network: Network) -> Result<Address, HtlcError> {
-        self.derived
-            .address(network)
-            .map_err(|e| log_err!(HtlcError::Miniscript(e), "address"))
+        Ok(Address::p2tr_tweaked(self.spend_info.output_key(), network))
     }
 
     pub fn create_claim_tx(
@@ -188,11 +185,8 @@ impl<'a> Htlc<'a> {
             &spend_tx,
             vin_index,
             prev_txout,
-            self.claim_addr_index,
-            self.claim_xonly_pubkey,
+            SpendLeaf::Claim,
             Some(preimage),
-            None,
-            "claim",
         )?;
         spend_tx.input[vin_index].witness = Witness::from_slice(&witness);
 
@@ -204,11 +198,8 @@ impl<'a> Htlc<'a> {
             &spend_tx,
             vin_index,
             prev_txout,
-            self.claim_addr_index,
-            self.claim_xonly_pubkey,
+            SpendLeaf::Claim,
             Some(preimage),
-            None,
-            "claim",
         )?;
         spend_tx.input[vin_index].witness = Witness::from_slice(&witness);
 
@@ -237,16 +228,14 @@ impl<'a> Htlc<'a> {
             }],
         };
 
+        // dummy witness stack for calculate fee
         let witness = self.htlc_witness_stack(
             true, // dummy
             &spend_tx,
             vin_index,
             prev_txout,
-            self.refund_addr_index,
-            self.refund_xonly_pubkey,
+            SpendLeaf::Refund,
             None,
-            Some(spend_tx.input[vin_index].sequence.to_consensus_u32()),
-            "refund",
         )?;
         spend_tx.input[vin_index].witness = Witness::from_slice(&witness);
 
@@ -258,39 +247,28 @@ impl<'a> Htlc<'a> {
             &spend_tx,
             vin_index,
             prev_txout,
-            self.refund_addr_index,
-            self.refund_xonly_pubkey,
+            SpendLeaf::Refund,
             None,
-            Some(spend_tx.input[vin_index].sequence.to_consensus_u32()),
-            "refund",
         )?;
         spend_tx.input[vin_index].witness = Witness::from_slice(&witness);
 
         Ok(spend_tx)
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn htlc_witness_stack(
         &self,
         is_dummy: bool,
         spend_tx: &Transaction,
         vin_index: usize,
         prev_txout: &TxOut,
-        addr_index: u32,
-        xonly_pubkey: XOnlyPublicKey,
+        leaf: SpendLeaf,
         preimage: Option<[u8; 32]>,
-        sequence: Option<u32>,
-        leaf_name: &str,
     ) -> Result<Vec<Vec<u8>>, HtlcError> {
-        let preimages: BTreeMap<sha256::Hash, Preimage32> = if let Some(preimage) = preimage {
-            let mut preimages = BTreeMap::new();
-            preimages.insert(self.preimage_hash, preimage);
-            preimages
-        } else {
-            BTreeMap::new()
+        let (leaf_data, addr_index) = match leaf {
+            SpendLeaf::Claim => (&self.claim_leaf, self.claim_addr_index),
+            SpendLeaf::Refund => (&self.refund_leaf, self.refund_addr_index),
         };
 
-        let spend_data = build_taproot_leaf_spend_data(&self.derived, xonly_pubkey, leaf_name)?;
         let taproot_sig = sign_taproot_script_spend(
             self.wallet,
             is_dummy,
@@ -298,71 +276,75 @@ impl<'a> Htlc<'a> {
             spend_tx,
             vin_index,
             prev_txout,
-            spend_data.leaf_hash,
+            leaf_data.leaf_hash,
         )?;
 
-        let pk = PublicKey::from(xonly_pubkey.public_key(Parity::Even));
+        // TapSighashType::Defaultなのでsighash byteは付加しない(64byte)
+        let mut witness = vec![taproot_sig.signature.serialize().to_vec()];
 
-        let mut sigs = BTreeMap::new();
-        sigs.insert((pk, spend_data.leaf_hash), taproot_sig);
+        if let SpendLeaf::Claim = leaf {
+            let preimage = preimage.ok_or_else(|| {
+                log_err!(HtlcError::Witness("claim".to_string()), "missing preimage")
+            })?;
+            if sha256::Hash::hash(&preimage) != self.preimage_hash {
+                return Err(log_err!(
+                    HtlcError::Witness("claim".to_string()),
+                    "preimage hash mismatch"
+                ));
+            }
+            witness.push(preimage.to_vec());
+        }
 
-        let mut control_blocks = BTreeMap::new();
-        control_blocks.insert(
-            spend_data.control_block,
-            (spend_data.leaf_script, LeafVersion::TapScript),
-        );
-
-        let satisfier = HtlcSatisfier {
-            sigs,
-            preimages,
-            control_blocks,
-            sequence,
-        };
-
-        let htlc_definite = self
-            .derived
-            .derived_descriptor(self.secp)
-            .map_err(|e| log_err!(HtlcError::Conversion(e), "witness_stack"))?;
-        let (witness_stack, _script_sig) = htlc_definite
-            .get_satisfaction(satisfier)
-            .map_err(|e| log_err!(HtlcError::Miniscript(e), "get_satisfaction"))?;
-        Ok(witness_stack)
+        witness.push(leaf_data.script.to_bytes());
+        witness.push(leaf_data.control_block.serialize());
+        Ok(witness)
     }
 }
 
-fn build_taproot_leaf_spend_data(
-    htlc_derived: &Descriptor<DefiniteDescriptorKey>,
-    xonly: XOnlyPublicKey,
-    leaf_name: &str,
-) -> Result<TaprootSpendData, HtlcError> {
-    let Descriptor::Tr(tr) = htlc_derived else {
-        return Err(log_err!(
-            HtlcError::Witness(leaf_name.to_string()),
-            "expected Taproot descriptor"
-        ));
-    };
+/// claim(preimage)ルートのleafスクリプト
+/// len(x) = 32 and SHA256(x) = preimage_hash
+fn claim_leaf_script(
+    preimage_hash: &sha256::Hash,
+    claim_xonly_pubkey: &XOnlyPublicKey,
+) -> ScriptBuf {
+    Builder::new()
+        .push_opcode(opcodes::all::OP_SIZE)
+        .push_int(32)
+        .push_opcode(opcodes::all::OP_EQUALVERIFY)
+        .push_opcode(opcodes::all::OP_SHA256)
+        .push_slice(preimage_hash.to_byte_array())
+        .push_opcode(opcodes::all::OP_EQUALVERIFY)
+        .push_slice(claim_xonly_pubkey.serialize())
+        .push_opcode(opcodes::all::OP_CHECKSIG)
+        .into_script()
+}
 
-    let spend_info = tr.spend_info();
-    let xonly_bytes = xonly.serialize();
-    let (leaf_script, control_block) = spend_info
-        .script_map()
-        .keys()
-        .find_map(|(script, ver)| {
-            if script.as_bytes().windows(32).any(|w| w == xonly_bytes) {
-                spend_info
-                    .control_block(&(script.clone(), *ver))
-                    .map(|cb| (script.clone(), cb))
-            } else {
-                None
-            }
-        })
-        .ok_or_else(|| log_err!(HtlcError::Witness(leaf_name.to_string()), "leaf not found"))?;
+/// refund(CSV)ルートのleafスクリプト
+/// nSequence >= csv_blocks (and compatible)
+fn refund_leaf_script(csv_blocks: u32, refund_xonly_pubkey: &XOnlyPublicKey) -> ScriptBuf {
+    Builder::new()
+        .push_int(csv_blocks as i64)
+        .push_opcode(opcodes::all::OP_CSV)
+        .push_opcode(opcodes::all::OP_DROP) // OP_CSVはスタックエントリを消費しない
+        .push_slice(refund_xonly_pubkey.serialize())
+        .push_opcode(opcodes::all::OP_CHECKSIG)
+        .into_script()
+}
 
-    let leaf_hash = TapLeafHash::from_script(&leaf_script, LeafVersion::TapScript);
-    Ok(TaprootSpendData {
-        leaf_script,
-        control_block,
+/// TaprootSpendInfoからleafスクリプトの支払い情報を取り出す。
+fn leaf_spend(
+    spend_info: &TaprootSpendInfo,
+    script: ScriptBuf,
+    name: &str,
+) -> Result<TapLeafSpend, HtlcError> {
+    let leaf_hash = TapLeafHash::from_script(&script, LeafVersion::TapScript);
+    let control_block = spend_info
+        .control_block(&(script.clone(), LeafVersion::TapScript))
+        .ok_or_else(|| log_err!(HtlcError::Witness(name.to_string()), "control block"))?;
+    Ok(TapLeafSpend {
+        script,
         leaf_hash,
+        control_block,
     })
 }
 
@@ -403,6 +385,12 @@ fn sign_taproot_script_spend(
 }
 
 fn sign_schnorr(wallet: &Wallet, addr_index: u32, msg: &Message) -> Result<Signature, HtlcError> {
+    let keypair = derive_keypair(wallet, addr_index)?;
+    Ok(wallet.secp_ctx().sign_schnorr(msg, &keypair))
+}
+
+/// ウォレット(External keychain)のxprvから`addr_index`に対応するKeypairを導出する。
+fn derive_keypair(wallet: &Wallet, addr_index: u32) -> Result<Keypair, HtlcError> {
     let signers = wallet.get_signers(KeychainKind::External);
     let xprv = signers
         .signers()
@@ -411,7 +399,12 @@ fn sign_schnorr(wallet: &Wallet, addr_index: u32, msg: &Message) -> Result<Signa
             Some(DescriptorSecretKey::XPrv(xprv)) => Some(xprv),
             _ => None,
         })
-        .ok_or_else(|| log_err!(HtlcError::Sign, "no secret key in wallet"))?;
+        .ok_or_else(|| {
+            log_err!(
+                HtlcError::NoKey("no secret key in wallet".to_string()),
+                "derive_keypair"
+            )
+        })?;
 
     let child = ChildNumber::from_normal_idx(addr_index)
         .map_err(|e| log_err!(HtlcError::Bip32(e), "from_normal_idx"))?;
@@ -426,8 +419,7 @@ fn sign_schnorr(wallet: &Wallet, addr_index: u32, msg: &Message) -> Result<Signa
         .map_err(|e| log_err!(HtlcError::Bip32(e), "derive_priv"))?
         .private_key;
 
-    let keypair = Keypair::from_secret_key(secp, &sec_key);
-    Ok(secp.sign_schnorr(msg, &keypair))
+    Ok(Keypair::from_secret_key(secp, &sec_key))
 }
 
 pub fn xonly_pubkey(hex_str: &str) -> Result<XOnlyPublicKey, HtlcError> {
@@ -440,19 +432,8 @@ pub fn convert_xonly_pubkey(
     wallet: &Wallet,
     addr_info: &AddressInfo,
 ) -> Result<XOnlyPublicKey, HtlcError> {
-    let xonly: XOnlyPublicKey = {
-        let desc = wallet
-            .public_descriptor(KeychainKind::External)
-            .at_derivation_index(addr_info.index)
-            .map_err(|e| log_err!(HtlcError::Conversion(e), "at_derivation_index"))?
-            .derived_descriptor(wallet.secp_ctx())
-            .map_err(|e| log_err!(HtlcError::Conversion(e), "derived_descriptor"))?;
-        match desc {
-            Descriptor::Tr(tr) => tr.internal_key().inner.x_only_public_key().0,
-            _ => Err(HtlcError::NoKey("Expected Taproot descriptor".into()))?,
-        }
-    };
-    Ok(xonly)
+    let keypair = derive_keypair(wallet, addr_info.index)?;
+    Ok(keypair.x_only_public_key().0)
 }
 
 pub fn generate_preimage() -> ([u8; 32], sha256::Hash) {
@@ -460,27 +441,6 @@ pub fn generate_preimage() -> ([u8; 32], sha256::Hash) {
     rand::thread_rng().fill_bytes(&mut preimage);
     let hash: sha256::Hash = sha256::Hash::hash(&preimage);
     (preimage, hash)
-}
-
-fn generate_descriptor(
-    preimage_hash: &sha256::Hash,
-    csv_blocks: u32,
-    claim_xonly_pubkey: &XOnlyPublicKey,
-    refund_xonly_pubkey: &XOnlyPublicKey,
-) -> Result<Descriptor<DescriptorPublicKey>, HtlcError> {
-    let intr_ext = DescriptorPublicKey::from_str(NUMS_XPUBKEY)
-        .map_err(|e| log_err!(HtlcError::DescriptorKeyParse(e), "internal key"))?;
-    let (htlc_descriptor, _key_map, _networks) = bdk_wallet::descriptor!(
-        tr(
-            intr_ext,
-            {
-                and_v(v:sha256(*preimage_hash), pk(*claim_xonly_pubkey)),
-                and_v(v:older(csv_blocks), pk(*refund_xonly_pubkey))
-            }
-        )
-    )
-    .map_err(|e| log_err!(HtlcError::Descriptor(e), "desc! macro"))?;
-    Ok(htlc_descriptor)
 }
 
 fn fee_from_rate(fee_rate: f64, vsize: usize) -> Amount {

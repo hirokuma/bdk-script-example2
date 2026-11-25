@@ -28,15 +28,24 @@ Bitcoin Coreから `sendrawtransaction` でそのトランザクションを展�
 
 ## 補足
 
-P2TRなのでleafごとにスクリプトを持つ。
-今回は上側を通る。
+P2TRのleafはminiscript / descriptorを使わず、生のスクリプト（tapscript）で2本構成している。
+内部鍵はNUMSをそのまま使う。
+今回の例ではclaim側を通る。
+
+claim leaf(73byte)
 
 ```
-tr(
-    intr_ext,
-    {
-        and_v(v:sha256(payment_hash), pk(addr1_xonly)),
-        and_v(v:older(16),            pk(addr2_xonly))
-    }
-)
+OP_SIZE 0x20 OP_EQUALVERIFY
+OP_SHA256 <preimage_hash> OP_EQUALVERIFY
+<addr1_xonly> OP_CHECKSIG
 ```
+
+refund leaf(37byte、`HTLC_CSV = 16`のとき)
+
+```
+0x10 OP_CHECKSEQUENCEVERIFY OP_DROP
+<addr2_xonly> OP_CHECKSIG
+```
+
+`OP_CSV`は検証後にスタックの値を残すため、`OP_DROP`で除去する。
+witnessはclaimルートが`[sig, preimage, script, control_block]`、refundルートが`[sig, script, control_block]`。
