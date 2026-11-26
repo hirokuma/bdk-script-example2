@@ -4,7 +4,7 @@ use bdk_wallet::{
     AddressInfo, KeychainKind, Wallet,
     bitcoin::{
         Address, Amount, Network, OutPoint, ScriptBuf, Sequence, TapLeafHash, TapSighashType,
-        Transaction, TxIn, TxOut, Witness, absolute,
+        Transaction, TxIn, TxOut, Weight, Witness, absolute,
         bip32::{ChildNumber, DerivationPath, Error as Bip32Error},
         hashes::{Hash, sha256},
         key::{
@@ -61,11 +61,40 @@ pub enum HtlcError {
 // https://github.com/bitcoin/bips/blob/master/bip-0341.mediawiki#constructing-and-spending-taproot-outputs
 const NUMS_XPUBKEY: &str = "50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0";
 
+/// 署名で使うsighashタイプ。署名とサイズ見積りの両方でこの値を使う。
+const SIGHASH_TYPE: TapSighashType = TapSighashType::Default;
+
+/// witnessに置くpreimageの長さ(claimルート)
+const WITNESS_PREIMAGE_LEN: usize = 32;
+
+/// tapscriptのwitnessに置くSchnorr署名の長さ(BIP341)。
+/// SIGHASH_DEFAULT(0x00)はsighash byteなしの64byte、それ以外はsighash byte付きの65byte。
+/// rust-bitcoinはこのルールを公開定数として持たないため、署名と同じSIGHASH_TYPEから導く。
+const WITNESS_SIG_LEN: usize = match SIGHASH_TYPE {
+    TapSighashType::Default => 64,
+    _ => 65,
+};
+
 /// taprootのleafスクリプトと、それを使って支払うために必要な情報。
 struct TapLeafSpend {
     script: ScriptBuf,
     leaf_hash: TapLeafHash,
     control_block: ControlBlock,
+}
+
+impl TapLeafSpend {
+    /// このleafを満たすwitnessの各要素の長さ(本体のみ。
+    /// compact sizeプレフィックスはWitnessのシリアライズが付けるので扱わない)。
+    /// feeを求めるためにトランザクションサイズを見積もる根拠となる。
+    fn witness_item_lens(&self, with_preimage: bool) -> Vec<usize> {
+        let mut lens = vec![WITNESS_SIG_LEN];
+        if with_preimage {
+            lens.push(WITNESS_PREIMAGE_LEN);
+        }
+        lens.push(self.script.len());
+        lens.push(self.control_block.size());
+        lens
+    }
 }
 
 /// 支払い経路。claimはpreimageルート、refundはCSVルート。
@@ -106,6 +135,11 @@ pub struct Htlc<'a> {
     spend_info: TaprootSpendInfo,
     claim_leaf: TapLeafSpend,
     refund_leaf: TapLeafSpend,
+
+    /// 支払いトランザクション(入力1・出力1・P2TR出力)のweight。
+    /// witnessの長さはleafから決まるのでnew()で見積もっておく。
+    claim_weight: Weight,
+    refund_weight: Weight,
 }
 
 impl<'a> Htlc<'a> {
@@ -137,6 +171,21 @@ impl<'a> Htlc<'a> {
         let claim_leaf = leaf_spend(&spend_info, claim_script, "claim")?;
         let refund_leaf = leaf_spend(&spend_info, refund_script, "refund")?;
 
+        // fee計算に使うトランザクションサイズ(weight)はnew()で確定させる。
+        // outpoint・前出力のscript_pubkey/valueはサイズに影響しない。
+        let claim_weight = estimate_spend_tx_weight(
+            secp,
+            claim_xonly_pubkey,
+            Sequence::MAX,
+            &claim_leaf.witness_item_lens(true),
+        );
+        let refund_weight = estimate_spend_tx_weight(
+            secp,
+            refund_xonly_pubkey,
+            Sequence(csv_blocks),
+            &refund_leaf.witness_item_lens(false),
+        );
+
         Ok(Self {
             wallet,
             secp,
@@ -149,6 +198,8 @@ impl<'a> Htlc<'a> {
             spend_info,
             claim_leaf,
             refund_leaf,
+            claim_weight,
+            refund_weight,
         })
     }
 
@@ -164,46 +215,14 @@ impl<'a> Htlc<'a> {
         preimage: [u8; 32],
         fee_rate: f64,
     ) -> Result<Transaction, HtlcError> {
-        let mut spend_tx = Transaction {
-            version: transaction::Version::TWO,
-            lock_time: absolute::LockTime::ZERO,
-            input: vec![TxIn {
-                previous_output: prev_outpoint,
-                script_sig: ScriptBuf::new(),
-                sequence: Sequence::MAX,
-                witness: Witness::default(),
-            }],
-            output: vec![transaction::TxOut {
-                value: Amount::ZERO, // fee計算後に設定
-                script_pubkey: ScriptBuf::new_p2tr(self.secp, self.claim_xonly_pubkey, None),
-            }],
-        };
-
-        // dummy witness stack for calculate fee
-        let witness = self.htlc_witness_stack(
-            true, // dummy
-            &spend_tx,
-            vin_index,
-            prev_txout,
+        self.create_spend_tx(
             SpendLeaf::Claim,
-            Some(preimage),
-        )?;
-        spend_tx.input[vin_index].witness = Witness::from_slice(&witness);
-
-        let fee = fee_from_rate(fee_rate, spend_tx.vsize());
-        spend_tx.output[0].value = prev_txout.value - fee;
-
-        let witness = self.htlc_witness_stack(
-            false,
-            &spend_tx,
-            vin_index,
+            prev_outpoint,
             prev_txout,
-            SpendLeaf::Claim,
+            vin_index,
             Some(preimage),
-        )?;
-        spend_tx.input[vin_index].witness = Witness::from_slice(&witness);
-
-        Ok(spend_tx)
+            fee_rate,
+        )
     }
 
     pub fn create_refund_tx(
@@ -213,51 +232,66 @@ impl<'a> Htlc<'a> {
         vin_index: usize,
         fee_rate: f64,
     ) -> Result<Transaction, HtlcError> {
-        let mut spend_tx = Transaction {
-            version: transaction::Version::TWO,
-            lock_time: absolute::LockTime::ZERO,
-            input: vec![TxIn {
-                previous_output: prev_outpoint,
-                script_sig: ScriptBuf::new(),
-                sequence: Sequence(self.csv_blocks),
-                witness: Witness::default(),
-            }],
-            output: vec![transaction::TxOut {
-                value: Amount::ZERO, // fee計算後に設定
-                script_pubkey: ScriptBuf::new_p2tr(self.secp, self.refund_xonly_pubkey, None),
-            }],
-        };
-
-        // dummy witness stack for calculate fee
-        let witness = self.htlc_witness_stack(
-            true, // dummy
-            &spend_tx,
-            vin_index,
-            prev_txout,
+        self.create_spend_tx(
             SpendLeaf::Refund,
+            prev_outpoint,
+            prev_txout,
+            vin_index,
             None,
-        )?;
-        spend_tx.input[vin_index].witness = Witness::from_slice(&witness);
+            fee_rate,
+        )
+    }
 
-        let fee = fee_from_rate(fee_rate, spend_tx.vsize());
+    /// leafを使う支払いトランザクションを作る。
+    /// fee計算に必要なサイズはnew()で見積もってあるので、
+    /// 署名はfee(output value)が確定した後に1回だけ行う。
+    fn create_spend_tx(
+        &self,
+        leaf: SpendLeaf,
+        prev_outpoint: OutPoint,
+        prev_txout: &TxOut,
+        vin_index: usize,
+        preimage: Option<[u8; 32]>,
+        fee_rate: f64,
+    ) -> Result<Transaction, HtlcError> {
+        let (_, _, dest, sequence, weight) = self.leaf_parts(leaf);
+
+        let mut spend_tx = build_spend_tx(self.secp, dest, prev_outpoint, Amount::ZERO, sequence);
+
+        let fee = fee_from_rate(fee_rate, weight);
         spend_tx.output[0].value = prev_txout.value - fee;
 
-        let witness = self.htlc_witness_stack(
-            false,
-            &spend_tx,
-            vin_index,
-            prev_txout,
-            SpendLeaf::Refund,
-            None,
-        )?;
+        let witness = self.htlc_witness_stack(&spend_tx, vin_index, prev_txout, leaf, preimage)?;
         spend_tx.input[vin_index].witness = Witness::from_slice(&witness);
 
         Ok(spend_tx)
     }
 
+    /// leafごとの (leaf情報, アドレスindex, 送金先xonly鍵, nSequence, weight)
+    fn leaf_parts(
+        &self,
+        leaf: SpendLeaf,
+    ) -> (&TapLeafSpend, u32, XOnlyPublicKey, Sequence, Weight) {
+        match leaf {
+            SpendLeaf::Claim => (
+                &self.claim_leaf,
+                self.claim_addr_index,
+                self.claim_xonly_pubkey,
+                Sequence::MAX,
+                self.claim_weight,
+            ),
+            SpendLeaf::Refund => (
+                &self.refund_leaf,
+                self.refund_addr_index,
+                self.refund_xonly_pubkey,
+                Sequence(self.csv_blocks),
+                self.refund_weight,
+            ),
+        }
+    }
+
     fn htlc_witness_stack(
         &self,
-        is_dummy: bool,
         spend_tx: &Transaction,
         vin_index: usize,
         prev_txout: &TxOut,
@@ -271,7 +305,6 @@ impl<'a> Htlc<'a> {
 
         let taproot_sig = sign_taproot_script_spend(
             self.wallet,
-            is_dummy,
             addr_index,
             spend_tx,
             vin_index,
@@ -279,7 +312,7 @@ impl<'a> Htlc<'a> {
             leaf_data.leaf_hash,
         )?;
 
-        // TapSighashType::Defaultなのでsighash byteは付加しない(64byte)
+        // SIGHASH_TYPE(Default)なのでsighash byteは付加しない
         let mut witness = vec![taproot_sig.signature.serialize().to_vec()];
 
         if let SpendLeaf::Claim = leaf {
@@ -348,22 +381,63 @@ fn leaf_spend(
     })
 }
 
+/// 支払いトランザクションの骨組み(入力1・出力1・P2TR出力、witnessは空)。
+fn build_spend_tx(
+    secp: &Secp256k1<Secp256k1All>,
+    dest: XOnlyPublicKey,
+    prev_outpoint: OutPoint,
+    value: Amount,
+    sequence: Sequence,
+) -> Transaction {
+    Transaction {
+        version: transaction::Version::TWO,
+        lock_time: absolute::LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: prev_outpoint,
+            script_sig: ScriptBuf::new(),
+            sequence,
+            witness: Witness::default(),
+        }],
+        output: vec![transaction::TxOut {
+            value,
+            script_pubkey: ScriptBuf::new_p2tr(secp, dest, None),
+        }],
+    }
+}
+
+/// サイズ見積り用のダミーwitness。内容はゼロだが要素の長さは本物と同じ。
+/// compact sizeプレフィックスやsegment(=2byte)/要素数はWitnessのシリアライズが払う。
+// lensには各witness stackのサイズだけが入っている。
+// これを使って各witness stackのサイズありデータ(中身は空)を作り、Witness::from_slice()でダミーwitnessを返す
+fn dummy_witness(lens: &[usize]) -> Witness {
+    let items: Vec<Vec<u8>> = lens.iter().map(|&len| vec![0u8; len]).collect();
+    Witness::from_slice(&items)
+}
+
+/// 支払いトランザクション(入力1・出力1・P2TR出力)のweightを見積もる。
+/// 前の出力のscript_pubkey/value、outpointの実体はサイズに影響しない。
+/// 前提: 入力1・出力1。入出力数を変えるならこの見積りは使えない。
+fn estimate_spend_tx_weight(
+    secp: &Secp256k1<Secp256k1All>,
+    dest: XOnlyPublicKey,
+    sequence: Sequence,
+    witness_item_lens: &[usize],
+) -> Weight {
+    let mut tx = build_spend_tx(secp, dest, OutPoint::null(), Amount::ZERO, sequence);
+    // サイズを決めるためにダミーのwitnessを作って突っ込む。INPUT1つ分。
+    // データはダミーではあるが実サイズベースなので問題はない。
+    tx.input[0].witness = dummy_witness(witness_item_lens);
+    tx.weight()
+}
+
 fn sign_taproot_script_spend(
     wallet: &Wallet,
-    is_dummy: bool,
     addr_index: u32,
     spend_tx: &Transaction,
     vin_index: usize,
     prev_txout: &TxOut,
     leaf_hash: TapLeafHash,
 ) -> Result<TaprootSig, HtlcError> {
-    if is_dummy {
-        let dummy = Signature::from_slice(&[0u8; 64]).unwrap();
-        return Ok(TaprootSig {
-            signature: dummy,
-            sighash_type: TapSighashType::Default,
-        });
-    }
     let prevouts = [prev_txout];
     let mut sighash_cache = SighashCache::new(spend_tx);
     let sighash = sighash_cache
@@ -371,7 +445,7 @@ fn sign_taproot_script_spend(
             vin_index,
             &Prevouts::All(&prevouts),
             leaf_hash,
-            TapSighashType::Default,
+            SIGHASH_TYPE,
         )
         .map_err(|e| log_err!(HtlcError::Taproot(e), "taproot_script_spend_signature_hash"))?;
 
@@ -380,7 +454,7 @@ fn sign_taproot_script_spend(
 
     Ok(TaprootSig {
         signature,
-        sighash_type: TapSighashType::Default,
+        sighash_type: SIGHASH_TYPE,
     })
 }
 
@@ -443,9 +517,22 @@ pub fn generate_preimage() -> ([u8; 32], sha256::Hash) {
     (preimage, hash)
 }
 
-fn fee_from_rate(fee_rate: f64, vsize: usize) -> Amount {
-    let fee = (fee_rate * vsize as f64 + 0.5) as u64;
+/// sat/vB のレートとトランザクションweightからfeeを求める。
+/// feeは実際のweight(wu)に対して計算する(vBへの切り上げを挟まない)。
+/// 浮動小数のまま計算せず、整数演算にして丸めの位置と方向を明示する。
+fn fee_from_rate(fee_rate: f64, weight: Weight) -> Amount {
+    // sat/vB → sat/kwu (1 sat/vB = 250 sat/kwu)。
+    // FeeRateの格子は0.004 sat/vBなので、小数第1位までの値は丸め誤差なしに変換できる。
+    let sat_per_kwu = (fee_rate * 250.0).round() as u64;
+
+    // sat/kwu * wu / 1000 を切り上げてfeeを確定する(過少支払いを避ける)。
+    let fee = sat_per_kwu.saturating_mul(weight.to_wu()).div_ceil(1000);
+
     debug!("fee_rate = {}", fee_rate);
+    debug!("weight = {} wu", weight.to_wu());
     debug!("fee = {}", fee);
     Amount::from_sat(fee)
 }
+
+#[cfg(test)]
+mod tests;
