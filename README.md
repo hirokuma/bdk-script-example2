@@ -1,6 +1,7 @@
 # bdk-script-example2
 
 BDKでHTLCを作ってpreimageが必要なルート。
+このブランチではP2TRで直接OPコードを使って記述している。
 
 ## 準備
 
